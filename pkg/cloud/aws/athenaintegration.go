@@ -8,13 +8,14 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/athena/types"
+	"github.com/opencost/opencost/core/pkg/log"
+	"github.com/opencost/opencost/core/pkg/opencost"
 	"github.com/opencost/opencost/pkg/cloud"
-	"github.com/opencost/opencost/pkg/kubecost"
-	"github.com/opencost/opencost/pkg/log"
-	"github.com/opencost/opencost/pkg/util/timeutil"
 )
 
 const LabelColumnPrefix = "resource_tags_user_"
+const AWSLabelColumnPrefix = "resource_tags_aws_"
+const AthenaResourceTagPrefix = "resource_tags_"
 
 // athenaDateLayout is the default AWS date format
 const AthenaDateLayout = "2006-01-02 15:04:05.000"
@@ -29,14 +30,16 @@ const AthenaSPPricingColumn = "savings_plan_savings_plan_effective_cost"
 // Net Cost Columns
 const AthenaNetPricingColumn = "line_item_net_unblended_cost"
 
+var AthenaNetPricingCoalesce = fmt.Sprintf("COALESCE(%s, %s, 0)", AthenaNetPricingColumn, AthenaPricingColumn)
+
 // Amortized Net Cost Columns
 const AthenaNetRIPricingColumn = "reservation_net_effective_cost"
+
+var AthenaNetRIPricingCoalesce = fmt.Sprintf("COALESCE(%s, %s, 0)", AthenaNetRIPricingColumn, AthenaRIPricingColumn)
+
 const AthenaNetSPPricingColumn = "savings_plan_net_savings_plan_effective_cost"
 
-// Category Columns
-const AthenaIsNode = "SUBSTRING(line_item_resource_id,1,2) = 'i-'"
-const AthenaIsVol = "SUBSTRING(line_item_resource_id, 1, 4) = 'vol-'"
-const AthenaIsNetwork = "line_item_usage_type LIKE '%Bytes'"
+var AthenaNetSPPricingCoalesce = fmt.Sprintf("COALESCE(%s, %s, 0)", AthenaNetSPPricingColumn, AthenaSPPricingColumn)
 
 // athenaDateTruncColumn Aggregates line items from the hourly level to daily. "line_item_usage_start_date" is used because at
 // all time values 00:00-23:00 it will truncate to the correct date.
@@ -48,19 +51,15 @@ const AthenaWhereUsage = "(line_item_line_item_type = 'Usage' OR line_item_line_
 
 // AthenaQueryIndexes is a struct for holding the context of a query
 type AthenaQueryIndexes struct {
-	Query                     string
-	ColumnIndexes             map[string]int
-	TagColumns                []string
-	ListCostColumn            string
-	ListK8sCostColumn         string
-	NetCostColumn             string
-	NetK8sCostColumn          string
-	AmortizedNetCostColumn    string
-	AmortizedNetK8sCostColumn string
-	AmortizedCostColumn       string
-	AmortizedK8sCostColumn    string
-	InvoicedCostColumn        string
-	InvoicedK8sCostColumn     string
+	Query                  string
+	ColumnIndexes          map[string]int
+	TagColumns             []string
+	AWSTagColumns          []string
+	ListCostColumn         string
+	NetCostColumn          string
+	AmortizedNetCostColumn string
+	AmortizedCostColumn    string
+	IsK8sColumn            string
 }
 
 type AthenaIntegration struct {
@@ -68,8 +67,8 @@ type AthenaIntegration struct {
 }
 
 // Query Athena for CUR data and build a new CloudCostSetRange containing the info
-func (ai *AthenaIntegration) GetCloudCost(start, end time.Time) (*kubecost.CloudCostSetRange, error) {
-	log.Infof("AthenaIntegration[%s]: StoreCloudCost: %s", ai.Key(), kubecost.NewWindow(&start, &end).String())
+func (ai *AthenaIntegration) GetCloudCost(start, end time.Time) (*opencost.CloudCostSetRange, error) {
+	log.Infof("AthenaIntegration[%s]: GetCloudCost: %s", ai.Key(), opencost.NewWindow(&start, &end).String())
 	// Query for all column names
 	allColumns, err := ai.GetColumns()
 	if err != nil {
@@ -84,20 +83,29 @@ func (ai *AthenaIntegration) GetCloudCost(start, end time.Time) (*kubecost.Cloud
 		"line_item_usage_account_id",
 		"line_item_product_code",
 		"line_item_usage_type",
-		AthenaIsNode,
-		AthenaIsVol,
-		AthenaIsNetwork,
+		"product_region_code",
+		"line_item_availability_zone",
 	}
 
 	// Create query indices
 	aqi := AthenaQueryIndexes{}
 
+	// Add is k8s column
+	isK8sColumn := ai.GetIsKubernetesColumn(allColumns)
+	groupByColumns = append(groupByColumns, isK8sColumn)
+	aqi.IsK8sColumn = isK8sColumn
+
 	// Determine which columns are user-defined tags and add those to the list
 	// of columns to query.
 	for column := range allColumns {
 		if strings.HasPrefix(column, LabelColumnPrefix) {
+			quotedTag := fmt.Sprintf(`"%s"`, column)
+			groupByColumns = append(groupByColumns, quotedTag)
+			aqi.TagColumns = append(aqi.TagColumns, quotedTag)
+		}
+		if strings.HasPrefix(column, AWSLabelColumnPrefix) {
 			groupByColumns = append(groupByColumns, column)
-			aqi.TagColumns = append(aqi.TagColumns, column)
+			aqi.AWSTagColumns = append(aqi.AWSTagColumns, column)
 		}
 	}
 	var selectColumns []string
@@ -109,69 +117,39 @@ func (ai *AthenaIntegration) GetCloudCost(start, end time.Time) (*kubecost.Cloud
 	ai.RemoveColumnAliases(groupByColumns)
 
 	// Build list cost column and add it to the select columns
-	listCostColumn := fmt.Sprintf("SUM(%s) as list_cost", ai.GetListCostColumn())
+	listCostColumn := ai.GetListCostColumn()
 	selectColumns = append(selectColumns, listCostColumn)
 	aqi.ListCostColumn = listCostColumn
-	listK8sCostColumn := fmt.Sprintf(
-		"SUM(%s) as list_kubernetes_cost",
-		ai.GetKubernetesCostColumn(allColumns, ai.GetListCostColumn()),
-	)
-	selectColumns = append(selectColumns, listK8sCostColumn)
-	aqi.ListK8sCostColumn = listK8sCostColumn
 
 	// Build net cost column and add it to select columns
-	netCostColumn := fmt.Sprintf("SUM(%s) as net_cost", ai.GetNetCostColumn(allColumns))
+	netCostColumn := ai.GetNetCostColumn(allColumns)
 	selectColumns = append(selectColumns, netCostColumn)
 	aqi.NetCostColumn = netCostColumn
-	netK8sCostColumn := fmt.Sprintf(
-		"SUM(%s) as net_kubernetes_cost",
-		ai.GetKubernetesCostColumn(allColumns, ai.GetNetCostColumn(allColumns)),
-	)
-	selectColumns = append(selectColumns, netK8sCostColumn)
-	aqi.NetK8sCostColumn = netK8sCostColumn
 
 	// Build amortized net cost column and add it to select columns
-	amortizedNetCostColumn := fmt.Sprintf("SUM(%s) as amortized_net_cost", ai.GetAmortizedNetCostColumn(allColumns))
+	amortizedNetCostColumn := ai.GetAmortizedNetCostColumn(allColumns)
 	selectColumns = append(selectColumns, amortizedNetCostColumn)
 	aqi.AmortizedNetCostColumn = amortizedNetCostColumn
-	amortizedNetK8sCostColumn := fmt.Sprintf(
-		"SUM(%s) as amortized_net_kubernetes_cost",
-		ai.GetKubernetesCostColumn(allColumns, ai.GetNetCostColumn(allColumns)),
-	)
-	selectColumns = append(selectColumns, amortizedNetK8sCostColumn)
-	aqi.AmortizedNetK8sCostColumn = amortizedNetK8sCostColumn
 
 	// Build Amortized cost column and add it to select columns
-	amortizedCostColumn := fmt.Sprintf("SUM(%s) as amortized_cost", ai.GetAmortizedCostCase(allColumns))
+	amortizedCostColumn := ai.GetAmortizedCostColumn(allColumns)
 	selectColumns = append(selectColumns, amortizedCostColumn)
 	aqi.AmortizedCostColumn = amortizedCostColumn
-	amortizedK8sCostColumn := fmt.Sprintf(
-		"SUM(%s) as amortized_kubernetes_cost",
-		ai.GetKubernetesCostColumn(allColumns, ai.GetAmortizedCostCase(allColumns)),
-	)
-	selectColumns = append(selectColumns, amortizedK8sCostColumn)
-	aqi.AmortizedK8sCostColumn = amortizedK8sCostColumn
-
-	// We are using Net Cost for Invoiced Cost for now as it is the closest approximation
-	invoicedCostColumn := netCostColumn
-	selectColumns = append(selectColumns, invoicedCostColumn)
-	aqi.InvoicedCostColumn = invoicedCostColumn
-	invoicedK8sCostColumn := netK8sCostColumn
-	selectColumns = append(selectColumns, invoicedK8sCostColumn)
-	aqi.InvoicedK8sCostColumn = invoicedK8sCostColumn
 
 	// Build map of query columns to use for parsing query
 	aqi.ColumnIndexes = map[string]int{}
 	for i, column := range selectColumns {
 		aqi.ColumnIndexes[column] = i
 	}
-	athenaWhereDate := fmt.Sprintf(AthenaWhereDateFmt, start.Format("2006-01-02"), end.Format("2006-01-02"))
+	whereDate := fmt.Sprintf(AthenaWhereDateFmt, start.Format("2006-01-02"), end.Format("2006-01-02"))
+	wherePartitions := ai.GetPartitionWhere(start, end)
 
 	// Query for all line items with a resource_id or from AWS Marketplace, which did not end before
 	// the range or start after it. This captures all costs with any amount of
 	// overlap with the range, for which we will only extract the relevant costs
 	whereConjuncts := []string{
-		athenaWhereDate,
+		wherePartitions,
+		whereDate,
 		AthenaWhereUsage,
 	}
 	columnStr := strings.Join(selectColumns, ", ")
@@ -179,37 +157,36 @@ func (ai *AthenaIntegration) GetCloudCost(start, end time.Time) (*kubecost.Cloud
 	groupByStr := strings.Join(groupByColumns, ", ")
 	queryStr := `
 		SELECT %s
-		FROM %s
+		FROM "%s"
 		WHERE %s
 		GROUP BY %s
 	`
 	aqi.Query = fmt.Sprintf(queryStr, columnStr, ai.Table, whereClause, groupByStr)
 
-	CCSR, err := kubecost.NewCloudCostSetRange(start, end, timeutil.Day, ai.Key())
+	ccsr, err := opencost.NewCloudCostSetRange(start, end, opencost.AccumulateOptionDay, ai.Key())
 	if err != nil {
 		return nil, err
 	}
 
 	// Generate row handling function.
 	rowHandler := func(row types.Row) {
-		err2 := ai.RowToCloudCost(row, aqi, CCSR)
+		cc, err2 := athenaRowToCloudCost(row, aqi)
 		if err2 != nil {
-			log.Errorf("AthenaIntegration: queryCloudCostCompute: error while parsing row: %s", err2.Error())
+			log.Errorf("AthenaIntegration: GetCloudCost: error while parsing row: %s", err2.Error())
+			return
 		}
+		ccsr.LoadCloudCost(cc)
 	}
-	log.Debugf("AthenaIntegration[%s]: queryCloudCostCompute: querying: %s", ai.Key(), aqi.Query)
+	log.Debugf("AthenaIntegration[%s]: GetCloudCost: querying: %s", ai.Key(), aqi.Query)
 	// Query CUR data and fill out CCSR
 	err = ai.Query(context.TODO(), aqi.Query, GetAthenaQueryFunc(rowHandler))
 	if err != nil {
 		return nil, err
 	}
 
-	// TODO: May not be needed anymore?
-	for _, ccs := range CCSR.CloudCostSets {
-		log.Debugf("AthenaIntegration[%s]: queryCloudCostCompute: writing compute items for window %s: %d", ai.Key(), ccs.Window, len(ccs.CloudCosts))
-		ai.ConnectionStatus = ai.GetConnectionStatusFromResult(ccs, ai.ConnectionStatus)
-	}
-	return CCSR, nil
+	ai.ConnectionStatus = ai.GetConnectionStatusFromResult(ccsr, ai.ConnectionStatus)
+
+	return ccsr, nil
 
 }
 
@@ -221,17 +198,22 @@ func (ai *AthenaIntegration) GetListCostColumn() string {
 	listCostBuilder.WriteString(" ELSE ")
 	listCostBuilder.WriteString(AthenaPricingColumn)
 	listCostBuilder.WriteString(" END")
-	return listCostBuilder.String()
+	return fmt.Sprintf("SUM(%s) as list_cost", listCostBuilder.String())
 }
 
 func (ai *AthenaIntegration) GetNetCostColumn(allColumns map[string]bool) string {
 	netCostColumn := ""
 	if allColumns[AthenaNetPricingColumn] { // if Net pricing exists
-		netCostColumn = AthenaNetPricingColumn
+		netCostColumn = AthenaNetPricingCoalesce
 	} else { // Non-net for if there's no net pricing.
 		netCostColumn = AthenaPricingColumn
 	}
-	return netCostColumn
+	return fmt.Sprintf("SUM(%s) as net_cost", netCostColumn)
+}
+
+func (ai *AthenaIntegration) GetAmortizedCostColumn(allColumns map[string]bool) string {
+	amortizedCostCase := ai.GetAmortizedCostCase(allColumns)
+	return fmt.Sprintf("SUM(%s) as amortized_cost", amortizedCostCase)
 }
 
 func (ai *AthenaIntegration) GetAmortizedNetCostColumn(allColumns map[string]bool) string {
@@ -241,43 +223,7 @@ func (ai *AthenaIntegration) GetAmortizedNetCostColumn(allColumns map[string]boo
 	} else { // Non-net for if there's no net pricing.
 		amortizedNetCostCase = ai.GetAmortizedCostCase(allColumns)
 	}
-	return amortizedNetCostCase
-}
-
-// getIsKubernetesColumn generates a boolean column which determines whether a line item is from kubernetes
-func (ai *AthenaIntegration) GetIsKubernetesColumn(allColumns map[string]bool) string {
-	return ai.GetIsKubernetesCase(allColumns)
-}
-
-// getKubernetesCostColumn generates a double column which determines the cost of k8s items in an aggregate
-func (ai *AthenaIntegration) GetKubernetesCostColumn(allColumns map[string]bool, pricingCase string) string {
-	k8sCase := ai.GetIsKubernetesCase(allColumns)
-	return fmt.Sprintf("CAST((%s) as double) * (%s)", k8sCase, pricingCase)
-
-}
-
-func (ai *AthenaIntegration) RemoveColumnAliases(columns []string) {
-	for i, column := range columns {
-		if strings.Contains(column, " as ") {
-			columnValues := strings.Split(column, " as ")
-			columns[i] = columnValues[0]
-		}
-	}
-}
-
-func (ai *AthenaIntegration) ConvertLabelToAWSTag(label string) string {
-	// if the label already has the column prefix assume that it is in the correct format
-	if strings.HasPrefix(label, LabelColumnPrefix) {
-		return label
-	}
-	// replace characters with underscore
-	tag := label
-	tag = strings.ReplaceAll(tag, ".", "_")
-	tag = strings.ReplaceAll(tag, "/", "_")
-	tag = strings.ReplaceAll(tag, ":", "_")
-	tag = strings.ReplaceAll(tag, "-", "_")
-	// add prefix and return
-	return LabelColumnPrefix + tag
+	return fmt.Sprintf("SUM(%s) as amortized_net_cost", amortizedNetCostCase)
 }
 
 func (ai *AthenaIntegration) GetAmortizedCostCase(allColumns map[string]bool) string {
@@ -307,32 +253,58 @@ func (ai *AthenaIntegration) GetAmortizedCostCase(allColumns map[string]bool) st
 func (ai *AthenaIntegration) GetAmortizedNetCostCase(allColumns map[string]bool) string {
 	// Use net unblended costs if Reserved Instances/Savings Plans aren't in use
 	if !allColumns[AthenaNetRIPricingColumn] && !allColumns[AthenaNetSPPricingColumn] {
-		return AthenaNetPricingColumn
+		return AthenaNetPricingCoalesce
 	}
 
 	var costBuilder strings.Builder
 	costBuilder.WriteString("CASE line_item_line_item_type")
 	if allColumns[AthenaNetRIPricingColumn] {
 		costBuilder.WriteString(" WHEN 'DiscountedUsage' THEN ")
-		costBuilder.WriteString(AthenaNetRIPricingColumn)
+		costBuilder.WriteString(AthenaNetRIPricingCoalesce)
 	}
 
 	if allColumns[AthenaNetSPPricingColumn] {
 		costBuilder.WriteString(" WHEN 'SavingsPlanCoveredUsage' THEN ")
-		costBuilder.WriteString(AthenaNetSPPricingColumn)
+		costBuilder.WriteString(AthenaNetSPPricingCoalesce)
 	}
 
 	costBuilder.WriteString(" ELSE ")
-	costBuilder.WriteString(AthenaNetPricingColumn)
+	costBuilder.WriteString(AthenaNetPricingCoalesce)
 	costBuilder.WriteString(" END")
 	return costBuilder.String()
 }
 
-// GetIsKubernetesCase builds a "CASE" clause which attempts to determine if a line item is kubernetes based on labels
-// that may be available in the CUR
-func (ai *AthenaIntegration) GetIsKubernetesCase(allColumns map[string]bool) string {
-	// k8sColumns is a list of columns where the presence of a value indicates that a resource is part of a kubernetes cluster
-	k8sColumns := []string{
+func (ai *AthenaIntegration) RemoveColumnAliases(columns []string) {
+	for i, column := range columns {
+		if strings.Contains(column, " as ") {
+			columnValues := strings.Split(column, " as ")
+			columns[i] = columnValues[0]
+		}
+	}
+}
+
+func (ai *AthenaIntegration) ConvertLabelToAWSTag(label string) string {
+	// if the label already has the column prefix assume that it is in the correct format
+	if strings.HasPrefix(label, LabelColumnPrefix) {
+		return label
+	}
+	// replace characters with underscore
+	tag := label
+	tag = strings.ReplaceAll(tag, ".", "_")
+	tag = strings.ReplaceAll(tag, "/", "_")
+	tag = strings.ReplaceAll(tag, ":", "_")
+	tag = strings.ReplaceAll(tag, "-", "_")
+	// add prefix and return
+	return LabelColumnPrefix + tag
+}
+
+// GetIsKubernetesColumn builds a column that determines if a row represents kubernetes spend
+func (ai *AthenaIntegration) GetIsKubernetesColumn(allColumns map[string]bool) string {
+	disjuncts := []string{
+		"line_item_product_code = 'AmazonEKS'", // EKS is always kubernetes
+	}
+	// tagColumns is a list of columns where the presence of a value indicates that a resource is part of a kubernetes cluster
+	tagColumns := []string{
 		"resource_tags_aws_eks_cluster_name",
 		"resource_tags_user_eks_cluster_name",
 		"resource_tags_user_alpha_eksctl_io_cluster_name",
@@ -340,38 +312,56 @@ func (ai *AthenaIntegration) GetIsKubernetesCase(allColumns map[string]bool) str
 		"resource_tags_user_kubernetes_io_created_for_pvc_name",
 		"resource_tags_user_kubernetes_io_created_for_pv_name",
 	}
-	var k8sBuilder strings.Builder
 
-	k8sBuilder.WriteString("CASE ")
-	// EKS is always kubernetes
-	k8sBuilder.WriteString("WHEN line_item_product_code = 'AmazonEKS' THEN TRUE ")
-	for _, k8sColumn := range k8sColumns {
-		if _, ok := allColumns[k8sColumn]; ok {
-			k8sBuilder.WriteString("WHEN ")
-			k8sBuilder.WriteString(k8sColumn)
-			k8sBuilder.WriteString(" <> '' THEN TRUE ")
+	for _, tagColumn := range tagColumns {
+		// if tag column is present in the CUR check for it
+		if _, ok := allColumns[tagColumn]; ok {
+			disjunctStr := fmt.Sprintf("%s <> ''", tagColumn)
+			disjuncts = append(disjuncts, disjunctStr)
 		}
 	}
 
-	k8sBuilder.WriteString("ELSE FALSE END")
-	return k8sBuilder.String()
+	return fmt.Sprintf("(%s) as is_kubernetes", strings.Join(disjuncts, " OR "))
 }
 
-func (ai *AthenaIntegration) RowToCloudCost(row types.Row, aqi AthenaQueryIndexes, ccsr *kubecost.CloudCostSetRange) error {
+func (ai *AthenaIntegration) GetPartitionWhere(start, end time.Time) string {
+	month := time.Date(start.Year(), start.Month(), 1, 0, 0, 0, 0, time.UTC)
+	endMonth := time.Date(end.Year(), end.Month(), 1, 0, 0, 0, 0, time.UTC)
+	var disjuncts []string
+	for !month.After(endMonth) {
+		disjuncts = append(disjuncts, fmt.Sprintf("(year = '%d' AND month = '%d')", month.Year(), month.Month()))
+		month = month.AddDate(0, 1, 0)
+	}
+	str := fmt.Sprintf("(%s)", strings.Join(disjuncts, " OR "))
+	return str
+}
+
+func athenaRowToCloudCost(row types.Row, aqi AthenaQueryIndexes) (*opencost.CloudCost, error) {
 	if len(row.Data) < len(aqi.ColumnIndexes) {
-		return fmt.Errorf("rowToCloudCost: row with fewer than %d columns (has only %d)", len(aqi.ColumnIndexes), len(row.Data))
+		return nil, fmt.Errorf("rowToCloudCost: row with fewer than %d columns (has only %d)", len(aqi.ColumnIndexes), len(row.Data))
 	}
 
 	// Iterate through the slice of tag columns, assigning
 	// values to the column names, minus the tag prefix.
-	labels := kubecost.CloudCostLabels{}
-	labelValues := []string{}
+	labels := opencost.CloudCostLabels{}
 	for _, tagColumnName := range aqi.TagColumns {
-		labelName := strings.TrimPrefix(tagColumnName, LabelColumnPrefix)
+		// remove quotes
+		labelName := strings.TrimPrefix(tagColumnName, `"`)
+		labelName = strings.TrimSuffix(labelName, `"`)
+		// remove prefix
+		labelName = strings.TrimPrefix(labelName, LabelColumnPrefix)
 		value := GetAthenaRowValue(row, aqi.ColumnIndexes, tagColumnName)
 		if value != "" {
 			labels[labelName] = value
-			labelValues = append(labelValues, value)
+		}
+	}
+
+	for _, awsColumnName := range aqi.AWSTagColumns {
+		// partially remove prefix leaving "aws_"
+		labelName := strings.TrimPrefix(awsColumnName, AthenaResourceTagPrefix)
+		value := GetAthenaRowValue(row, aqi.ColumnIndexes, awsColumnName)
+		if value != "" {
+			labels[labelName] = value
 		}
 	}
 
@@ -381,68 +371,43 @@ func (ai *AthenaIntegration) RowToCloudCost(row types.Row, aqi AthenaQueryIndexe
 	providerID := GetAthenaRowValue(row, aqi.ColumnIndexes, "line_item_resource_id")
 	productCode := GetAthenaRowValue(row, aqi.ColumnIndexes, "line_item_product_code")
 	usageType := GetAthenaRowValue(row, aqi.ColumnIndexes, "line_item_usage_type")
-	isNode, _ := strconv.ParseBool(GetAthenaRowValue(row, aqi.ColumnIndexes, AthenaIsNode))
-	isVol, _ := strconv.ParseBool(GetAthenaRowValue(row, aqi.ColumnIndexes, AthenaIsVol))
-	isNetwork, _ := strconv.ParseBool(GetAthenaRowValue(row, aqi.ColumnIndexes, AthenaIsNetwork))
+	regionCode := GetAthenaRowValue(row, aqi.ColumnIndexes, "product_region_code")
+	availabilityZone := GetAthenaRowValue(row, aqi.ColumnIndexes, "line_item_availability_zone")
+	isK8s, _ := strconv.ParseBool(GetAthenaRowValue(row, aqi.ColumnIndexes, aqi.IsK8sColumn))
+	k8sPct := 0.0
+	if isK8s {
+		k8sPct = 1.0
+	}
 
 	listCost, err := GetAthenaRowValueFloat(row, aqi.ColumnIndexes, aqi.ListCostColumn)
 	if err != nil {
-		return err
-	}
-
-	listK8sCost, err := GetAthenaRowValueFloat(row, aqi.ColumnIndexes, aqi.ListK8sCostColumn)
-	if err != nil {
-		return err
+		return nil, err
 	}
 
 	netCost, err := GetAthenaRowValueFloat(row, aqi.ColumnIndexes, aqi.NetCostColumn)
 	if err != nil {
-		return err
-	}
-
-	netK8sCost, err := GetAthenaRowValueFloat(row, aqi.ColumnIndexes, aqi.NetK8sCostColumn)
-	if err != nil {
-		return err
+		return nil, err
 	}
 
 	amortizedNetCost, err := GetAthenaRowValueFloat(row, aqi.ColumnIndexes, aqi.AmortizedNetCostColumn)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	amortizedNetK8sCost, err := GetAthenaRowValueFloat(row, aqi.ColumnIndexes, aqi.AmortizedNetK8sCostColumn)
-	if err != nil {
-		return err
-	}
 	amortizedCost, err := GetAthenaRowValueFloat(row, aqi.ColumnIndexes, aqi.AmortizedCostColumn)
 	if err != nil {
-		return err
-	}
-
-	amortizedK8sCost, err := GetAthenaRowValueFloat(row, aqi.ColumnIndexes, aqi.AmortizedK8sCostColumn)
-	if err != nil {
-		return err
-	}
-
-	invoicedCost, err := GetAthenaRowValueFloat(row, aqi.ColumnIndexes, aqi.InvoicedCostColumn)
-	if err != nil {
-		return err
-	}
-
-	invoicedK8sCost, err := GetAthenaRowValueFloat(row, aqi.ColumnIndexes, aqi.InvoicedK8sCostColumn)
-	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// Identify resource category in the CUR
-	category := SelectAWSCategory(isNode, isVol, isNetwork, providerID, productCode)
+	category := SelectAWSCategory(providerID, usageType, productCode)
 
 	// Retrieve final stanza of product code for ProviderID
 	if productCode == "AWSELB" || productCode == "AmazonFSx" {
 		providerID = ParseARN(providerID)
 	}
 
-	if productCode == "AmazonEKS" && category == kubecost.ComputeCategory {
+	if productCode == "AmazonEKS" && category == opencost.ComputeCategory {
 		if strings.Contains(usageType, "CPU") {
 			providerID = fmt.Sprintf("%s/CPU", providerID)
 		} else if strings.Contains(usageType, "GB") {
@@ -450,58 +415,52 @@ func (ai *AthenaIntegration) RowToCloudCost(row types.Row, aqi AthenaQueryIndexe
 		}
 	}
 
-	properties := kubecost.CloudCostProperties{
-		ProviderID:      providerID,
-		Provider:        kubecost.AWSProvider,
-		AccountID:       accountID,
-		InvoiceEntityID: invoiceEntityID,
-		Service:         productCode,
-		Category:        category,
-		Labels:          labels,
+	properties := opencost.CloudCostProperties{
+		ProviderID:        providerID,
+		Provider:          opencost.AWSProvider,
+		AccountID:         accountID,
+		AccountName:       accountID,
+		InvoiceEntityID:   invoiceEntityID,
+		InvoiceEntityName: invoiceEntityID,
+		RegionID:          regionCode,
+		AvailabilityZone:  availabilityZone,
+		Service:           productCode,
+		Category:          category,
+		Labels:            labels,
 	}
 
 	start, err := time.Parse(AthenaDateLayout, startStr)
 	if err != nil {
-		return fmt.Errorf("unable to parse %s: '%s'", AthenaDateTruncColumn, err.Error())
+		return nil, fmt.Errorf("unable to parse %s: '%s'", AthenaDateTruncColumn, err.Error())
 	}
 	end := start.AddDate(0, 0, 1)
 
-	cc := &kubecost.CloudCost{
+	cc := &opencost.CloudCost{
 		Properties: &properties,
-		Window:     kubecost.NewWindow(&start, &end),
-		ListCost: kubecost.CostMetric{
+		Window:     opencost.NewWindow(&start, &end),
+		ListCost: opencost.CostMetric{
 			Cost:              listCost,
-			KubernetesPercent: ai.CalculateK8sPercent(listCost, listK8sCost),
+			KubernetesPercent: k8sPct,
 		},
-		NetCost: kubecost.CostMetric{
+		NetCost: opencost.CostMetric{
 			Cost:              netCost,
-			KubernetesPercent: ai.CalculateK8sPercent(netCost, netK8sCost),
+			KubernetesPercent: k8sPct,
 		},
-		AmortizedNetCost: kubecost.CostMetric{
+		AmortizedNetCost: opencost.CostMetric{
 			Cost:              amortizedNetCost,
-			KubernetesPercent: ai.CalculateK8sPercent(amortizedNetCost, amortizedNetK8sCost),
+			KubernetesPercent: k8sPct,
 		},
-		AmortizedCost: kubecost.CostMetric{
+		AmortizedCost: opencost.CostMetric{
 			Cost:              amortizedCost,
-			KubernetesPercent: ai.CalculateK8sPercent(amortizedCost, amortizedK8sCost),
+			KubernetesPercent: k8sPct,
 		},
-		InvoicedCost: kubecost.CostMetric{
-			Cost:              invoicedCost,
-			KubernetesPercent: ai.CalculateK8sPercent(invoicedCost, invoicedK8sCost),
+		InvoicedCost: opencost.CostMetric{
+			Cost:              netCost, // We are using Net Cost for Invoiced Cost for now as it is the closest approximation
+			KubernetesPercent: k8sPct,
 		},
 	}
 
-	ccsr.LoadCloudCost(cc)
-	return nil
-}
-
-func (ai *AthenaIntegration) CalculateK8sPercent(cost, k8sCost float64) float64 {
-	// Calculate percent of cost that is k8s with the k8sCost
-	k8sPercent := 0.0
-	if k8sCost != 0.0 && cost != 0.0 {
-		k8sPercent = k8sCost / cost
-	}
-	return k8sPercent
+	return cc, nil
 }
 
 func (ai *AthenaIntegration) GetConnectionStatusFromResult(result cloud.EmptyChecker, currentStatus cloud.ConnectionStatus) cloud.ConnectionStatus {
@@ -509,13 +468,4 @@ func (ai *AthenaIntegration) GetConnectionStatusFromResult(result cloud.EmptyChe
 		return cloud.MissingData
 	}
 	return cloud.SuccessfulConnection
-}
-
-func (ai *AthenaIntegration) GetConnectionStatus() string {
-	// initialize status if it has not done so; this can happen if the integration is inactive
-	if ai.ConnectionStatus.String() == "" {
-		ai.ConnectionStatus = cloud.InitialStatus
-	}
-
-	return ai.ConnectionStatus.String()
 }

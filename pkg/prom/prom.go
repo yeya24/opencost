@@ -3,6 +3,7 @@ package prom
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net"
 	"net/http"
@@ -12,15 +13,18 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/opencost/opencost/pkg/collections"
-	"github.com/opencost/opencost/pkg/log"
-	"github.com/opencost/opencost/pkg/util/fileutil"
-	"github.com/opencost/opencost/pkg/util/httputil"
-	"github.com/opencost/opencost/pkg/version"
+	"github.com/opencost/opencost/core/pkg/collections"
+	"github.com/opencost/opencost/core/pkg/log"
+	"github.com/opencost/opencost/core/pkg/util/fileutil"
+	"github.com/opencost/opencost/core/pkg/util/httputil"
+	"github.com/opencost/opencost/core/pkg/version"
+	"github.com/opencost/opencost/pkg/env"
 
 	golog "log"
 
 	prometheus "github.com/prometheus/client_golang/api"
+	restclient "k8s.io/client-go/rest"
+	certutil "k8s.io/client-go/util/cert"
 )
 
 var UserAgent = fmt.Sprintf("Opencost/%s", version.Version)
@@ -68,6 +72,9 @@ func (auth *ClientAuth) Apply(req *http.Request) {
 // during a retry. This is to prevent starvation on the request threads
 const MaxRetryAfterDuration = 10 * time.Second
 
+// Default header key for Mimir/Cortex-Tenant API requests
+const HeaderXScopeOrgId = "X-Scope-OrgID"
+
 // RateLimitRetryOpts contains retry options
 type RateLimitRetryOpts struct {
 	MaxRetries       int
@@ -114,14 +121,15 @@ func (rlre *RateLimitedResponseError) Error() string {
 // RateLimitedPrometheusClient is a prometheus client which limits the total number of
 // concurrent outbound requests allowed at a given moment.
 type RateLimitedPrometheusClient struct {
-	id             string
-	client         prometheus.Client
-	auth           *ClientAuth
-	queue          collections.BlockingQueue[*workRequest]
-	decorator      QueryParamsDecorator
-	rateLimitRetry *RateLimitRetryOpts
-	outbound       atomic.Int32
-	fileLogger     *golog.Logger
+	id                string
+	client            prometheus.Client
+	auth              *ClientAuth
+	queue             collections.BlockingQueue[*workRequest]
+	decorator         QueryParamsDecorator
+	rateLimitRetry    *RateLimitRetryOpts
+	outbound          atomic.Int32
+	fileLogger        *golog.Logger
+	headerXScopeOrgId string
 }
 
 // requestCounter is used to determine if the prometheus client keeps track of
@@ -140,15 +148,22 @@ func NewRateLimitedClient(
 	auth *ClientAuth,
 	decorator QueryParamsDecorator,
 	rateLimitRetryOpts *RateLimitRetryOpts,
-	queryLogFile string) (prometheus.Client, error) {
+	queryLogFile string,
+	headerXScopeOrgId string) (prometheus.Client, error) {
 
 	queue := collections.NewBlockingQueue[*workRequest]()
 
 	var logger *golog.Logger
 	if queryLogFile != "" {
 		exists, err := fileutil.FileExists(queryLogFile)
+		if err != nil {
+			log.Infof("Failed to check for existence of queryLogFile: %s: %s", queryLogFile, err)
+		}
 		if exists {
-			os.Remove(queryLogFile)
+			err = os.Remove(queryLogFile)
+			if err != nil {
+				log.Infof("Failed to remove queryLogFile: %s: %s", queryLogFile, err)
+			}
 		}
 
 		f, err := os.OpenFile(queryLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -169,13 +184,14 @@ func NewRateLimitedClient(
 	}
 
 	rlpc := &RateLimitedPrometheusClient{
-		id:             id,
-		client:         client,
-		queue:          queue,
-		decorator:      decorator,
-		rateLimitRetry: rateLimitRetryOpts,
-		auth:           auth,
-		fileLogger:     logger,
+		id:                id,
+		client:            client,
+		queue:             queue,
+		decorator:         decorator,
+		rateLimitRetry:    rateLimitRetryOpts,
+		auth:              auth,
+		fileLogger:        logger,
+		headerXScopeOrgId: headerXScopeOrgId,
 	}
 
 	// Start concurrent request processing
@@ -313,6 +329,10 @@ func (rlpc *RateLimitedPrometheusClient) worker() {
 
 // Rate limit and passthrough to prometheus client API
 func (rlpc *RateLimitedPrometheusClient) Do(ctx context.Context, req *http.Request) (*http.Response, []byte, error) {
+	if rlpc.headerXScopeOrgId != "" {
+		req.Header.Set(HeaderXScopeOrgId, rlpc.headerXScopeOrgId)
+	}
+
 	rlpc.auth.Apply(req)
 
 	respChan := make(chan *workResponse)
@@ -353,10 +373,27 @@ type PrometheusClientConfig struct {
 	Auth                  *ClientAuth
 	QueryConcurrency      int
 	QueryLogFile          string
+	HeaderXScopeOrgId     string
 }
 
 // NewPrometheusClient creates a new rate limited client which limits by outbound concurrent requests.
 func NewPrometheusClient(address string, config *PrometheusClientConfig) (prometheus.Client, error) {
+
+	var tlsCaCert *x509.CertPool
+	// We will use the service account token and service-ca.crt to authenticate with the Prometheus server via kube-rbac-proxy.
+	// We need to ensure that the service account has the necessary permissions to access the Prometheus server by binding it to the appropriate role.
+	if env.IsKubeRbacProxyEnabled() {
+		restConfig, err := restclient.InClusterConfig()
+		if err != nil {
+			log.Errorf("KUBE_RBAC_PROXY_ENABLED was set to true but failed to get in-cluster config: %s", err)
+		}
+		config.Auth.BearerToken = restConfig.BearerToken
+		tlsCaCert, err = certutil.NewPool(`/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt`)
+		if err != nil {
+			log.Errorf("KUBE_RBAC_PROXY_ENABLED was set to true but failed to load service-ca.crt: %s", err)
+		}
+	}
+
 	// may be necessary for long prometheus queries
 	rt := httputil.NewUserAgentTransport(UserAgent, &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
@@ -367,6 +404,7 @@ func NewPrometheusClient(address string, config *PrometheusClientConfig) (promet
 		TLSHandshakeTimeout: config.TLSHandshakeTimeout,
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: config.TLSInsecureSkipVerify,
+			RootCAs:            tlsCaCert,
 		},
 	})
 	pc := prometheus.Config{
@@ -387,6 +425,7 @@ func NewPrometheusClient(address string, config *PrometheusClientConfig) (promet
 		nil,
 		config.RateLimitRetryOpts,
 		config.QueryLogFile,
+		config.HeaderXScopeOrgId,
 	)
 }
 

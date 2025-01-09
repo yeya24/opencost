@@ -12,14 +12,14 @@
     "internetNetworkEgress": "0.143",
     "spotLabel": "kops.k8s.io/instancegroup",
     "spotLabelValue": "spotinstance-nodes",
-    "awsServiceKeyName": "AKIXXX",
+    "awsServiceKeyName": "",
     "awsServiceKeySecret": "",
-    "awsSpotDataRegion":"us-east-2",
-    "awsSpotDataBucket": "x",
-    "awsSpotDataPrefix": "spotdata",
-    "athenaBucketName": "s3://x",
-    "athenaRegion": "us-east-1",
+    "awsSpotDataRegion":"",
+    "awsSpotDataBucket": "",
+    "awsSpotDataPrefix": "",
+    "athenaBucketName": "",
+    "athenaRegion": "",
     "athenaDatabase": "",
     "athenaTable": "",
-    "projectID": "12345"
+    "projectID": ""
 }

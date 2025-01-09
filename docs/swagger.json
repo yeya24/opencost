@@ -16,7 +16,7 @@
   }
   ],
   "paths": {
-    "/allocation/compute": {
+    "/allocation": {
       "get": {
         "summary": "query for costs and resources allocated to Kubernetes workloads",
         "description": "The standard OpenCost API query for costs and resources allocated to Kubernetes workloads. You may specify the `window` date range, the Kubernetes primitive to `aggregate` on, the `step` for the duration of returned sets, and the `resolution` for the duration to use for Prometheus queries.",
@@ -69,7 +69,7 @@
           {
           "name": "aggregate",
           "in": "query",
-          "description": "Field by which to aggregate the results. Accepts: `cluster`, `node`, `namespace`, `controllerKind`, `controller`, `service`, `pod`, `container`, `label:<name>`, and `annotation:<name>`. Also accepts comma-separated lists for multi-aggregation, like `namespace,label:app`.",
+          "description": "Field by which to aggregate the results. Accepts: `all`, `cluster`, `node`, `namespace`, `controllerKind`, `controller`, `service`, `pod`, `container`, `label:<name>`, and `annotation:<name>`. Also accepts comma-separated lists for multi-aggregation, like `namespace,label:app`. Defaults to `cluster,node,namespace,pod,container`.",
           "required": false,
           "style": "form",
           "explode": true,
@@ -108,6 +108,10 @@
             "container": {
               "summary": "Aggregates by the containers present in the cluster",
               "value": "container"
+            },
+            "all": {
+              "summary": "Aggregates into a single allocation",
+              "value": "all"
             }
           }
         },

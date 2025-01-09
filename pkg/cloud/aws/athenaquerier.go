@@ -8,15 +8,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/opencost/opencost/pkg/cloud"
-	cloudconfig "github.com/opencost/opencost/pkg/cloud/config"
-
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/athena"
 	"github.com/aws/aws-sdk-go-v2/service/athena/types"
-	"github.com/opencost/opencost/pkg/kubecost"
-	"github.com/opencost/opencost/pkg/log"
-	"github.com/opencost/opencost/pkg/util/stringutil"
+	"github.com/opencost/opencost/core/pkg/log"
+	"github.com/opencost/opencost/core/pkg/opencost"
+	"github.com/opencost/opencost/core/pkg/util/stringutil"
+	"github.com/opencost/opencost/pkg/cloud"
 )
 
 type AthenaQuerier struct {
@@ -24,7 +22,15 @@ type AthenaQuerier struct {
 	ConnectionStatus cloud.ConnectionStatus
 }
 
-func (aq *AthenaQuerier) Equals(config cloudconfig.Config) bool {
+func (aq *AthenaQuerier) GetStatus() cloud.ConnectionStatus {
+	// initialize status if it has not done so; this can happen if the integration is inactive
+	if aq.ConnectionStatus.String() == "" {
+		aq.ConnectionStatus = cloud.InitialStatus
+	}
+	return aq.ConnectionStatus
+}
+
+func (aq *AthenaQuerier) Equals(config cloud.Config) bool {
 	thatConfig, ok := config.(*AthenaQuerier)
 	if !ok {
 		return false
@@ -90,6 +96,9 @@ func (aq *AthenaQuerier) queryAthenaPaginated(ctx context.Context, query string,
 		Database: aws.String(aq.Database),
 	}
 
+	if aq.Catalog != "" {
+		queryExecutionCtx.Catalog = aws.String(aq.Catalog)
+	}
 	resultConfiguration := &types.ResultConfiguration{
 		OutputLocation: aws.String(aq.Bucket),
 	}
@@ -106,6 +115,9 @@ func (aq *AthenaQuerier) queryAthenaPaginated(ctx context.Context, query string,
 
 	// Create Athena Client
 	cli, err := aq.GetAthenaClient()
+	if err != nil {
+		return fmt.Errorf("QueryAthenaPaginated: GetAthenaClient error: %s", err.Error())
+	}
 
 	// Query Athena
 	startQueryExecutionOutput, err := cli.StartQueryExecution(ctx, startQueryExecutionInput)
@@ -118,6 +130,7 @@ func (aq *AthenaQuerier) queryAthenaPaginated(ctx context.Context, query string,
 	}
 	queryResultsInput := &athena.GetQueryResultsInput{
 		QueryExecutionId: startQueryExecutionOutput.QueryExecutionId,
+		MaxResults:       aws.Int32(1000), // this is the default value
 	}
 	getQueryResultsPaginator := athena.NewGetQueryResultsPaginator(cli, queryResultsInput)
 	for getQueryResultsPaginator.HasMorePages() {
@@ -187,37 +200,41 @@ func GetAthenaRowValueFloat(row types.Row, queryColumnIndexes map[string]int, co
 	return cost, nil
 }
 
-func SelectAWSCategory(isNode, isVol, isNetwork bool, providerID, service string) string {
+func SelectAWSCategory(providerID, usageType, service string) string {
 	// Network has the highest priority and is based on the usage type ending in "Bytes"
-	if isNetwork {
-		return kubecost.NetworkCategory
+	if strings.HasSuffix(usageType, "Bytes") {
+		return opencost.NetworkCategory
 	}
 	// The node and volume conditions are mutually exclusive.
 	// Provider ID has prefix "i-"
-	if isNode {
-		return kubecost.ComputeCategory
+	if strings.HasPrefix(providerID, "i-") {
+		// GuardDuty has a ProviderID prefix of "i-", but should not be categorized as compute
+		if strings.ToUpper(service) == "AMAZONGUARDDUTY" {
+			return opencost.OtherCategory
+		}
+		return opencost.ComputeCategory
 	}
 	// Provider ID has prefix "vol-"
-	if isVol {
-		return kubecost.StorageCategory
+	if strings.HasPrefix(providerID, "vol-") {
+		return opencost.StorageCategory
 	}
 
 	// Default categories based on service
 	switch strings.ToUpper(service) {
 	case "AWSELB", "AWSGLUE", "AMAZONROUTE53":
-		return kubecost.NetworkCategory
+		return opencost.NetworkCategory
 	case "AMAZONEC2", "AWSLAMBDA", "AMAZONELASTICACHE":
-		return kubecost.ComputeCategory
+		return opencost.ComputeCategory
 	case "AMAZONEKS":
 		// Check if line item is a fargate pod
 		if strings.Contains(providerID, ":pod/") {
-			return kubecost.ComputeCategory
+			return opencost.ComputeCategory
 		}
-		return kubecost.ManagementCategory
+		return opencost.ManagementCategory
 	case "AMAZONS3", "AMAZONATHENA", "AMAZONRDS", "AMAZONDYNAMODB", "AWSSECRETSMANAGER", "AMAZONFSX":
-		return kubecost.StorageCategory
+		return opencost.StorageCategory
 	default:
-		return kubecost.OtherCategory
+		return opencost.OtherCategory
 	}
 }
 

@@ -17,26 +17,26 @@ import (
 	"github.com/opencost/opencost/pkg/cloud/aws"
 	"github.com/opencost/opencost/pkg/cloud/models"
 	"github.com/opencost/opencost/pkg/cloud/utils"
-	"github.com/opencost/opencost/pkg/kubecost"
 
+	"github.com/opencost/opencost/core/pkg/log"
+	"github.com/opencost/opencost/core/pkg/opencost"
+	"github.com/opencost/opencost/core/pkg/util"
+	"github.com/opencost/opencost/core/pkg/util/fileutil"
+	"github.com/opencost/opencost/core/pkg/util/json"
+	"github.com/opencost/opencost/core/pkg/util/timeutil"
 	"github.com/opencost/opencost/pkg/clustercache"
 	"github.com/opencost/opencost/pkg/env"
-	"github.com/opencost/opencost/pkg/log"
-	"github.com/opencost/opencost/pkg/util"
-	"github.com/opencost/opencost/pkg/util/fileutil"
-	"github.com/opencost/opencost/pkg/util/json"
-	"github.com/opencost/opencost/pkg/util/timeutil"
 	"github.com/rs/zerolog"
 
 	"cloud.google.com/go/bigquery"
 	"cloud.google.com/go/compute/metadata"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/compute/v1"
-	v1 "k8s.io/api/core/v1"
 )
 
 const GKE_GPU_TAG = "cloud.google.com/gke-accelerator"
 const BigqueryUpdateType = "bigqueryupdate"
+const BillingAPIURLFmt = "https://cloudbilling.googleapis.com/v1/services/6F81-5844-456A/skus?key=%s&currencyCode=%s"
 
 const (
 	GCPHourlyPublicIPCost = 0.01
@@ -66,17 +66,28 @@ var gcpRegions = []string{
 	"australia-southeast2",
 	"europe-central2",
 	"europe-north1",
+	"europe-southwest1",
 	"europe-west1",
+	"europe-west10",
+	"europe-west12",
 	"europe-west2",
 	"europe-west3",
 	"europe-west4",
 	"europe-west6",
+	"europe-west8",
+	"europe-west9",
+	"me-central1",
+	"me-central2",
+	"me-west1",
 	"northamerica-northeast1",
 	"northamerica-northeast2",
 	"southamerica-east1",
+	"southamerica-west1",
 	"us-central1",
 	"us-east1",
 	"us-east4",
+	"us-east5",
+	"us-south1",
 	"us-west1",
 	"us-west2",
 	"us-west3",
@@ -84,7 +95,8 @@ var gcpRegions = []string{
 }
 
 var (
-	nvidiaGPURegex = regexp.MustCompile("(Nvidia Tesla [^ ]+) ")
+	nvidiaTeslaGPURegex = regexp.MustCompile("(Nvidia Tesla [^ ]+) ")
+	nvidiaGPURegex      = regexp.MustCompile("(Nvidia [^ ]+) ")
 	// gce://guestbook-12345/...
 	//  => guestbook-12345
 	gceRegex = regexp.MustCompile("gce://([^/]*)/*")
@@ -139,11 +151,11 @@ func (gcp *GCP) GetLocalStorageQuery(window, offset time.Duration, rate bool, us
 	fmtOffset := timeutil.DurationToPromOffsetString(offset)
 
 	fmtCumulativeQuery := `sum(
-		sum_over_time(%s{device!="tmpfs", id="/"}[%s:1m]%s)
+		sum_over_time(%s{device!="tmpfs", id="/", %s}[%s:1m]%s)
 	) by (%s) / 60 / 730 / 1024 / 1024 / 1024 * %f`
 
 	fmtMonthlyQuery := `sum(
-		avg_over_time(%s{device!="tmpfs", id="/"}[%s:1m]%s)
+		avg_over_time(%s{device!="tmpfs", id="/", %s}[%s:1m]%s)
 	) by (%s) / 1024 / 1024 / 1024 * %f`
 
 	fmtQuery := fmtCumulativeQuery
@@ -152,7 +164,7 @@ func (gcp *GCP) GetLocalStorageQuery(window, offset time.Duration, rate bool, us
 	}
 	fmtWindow := timeutil.DurationString(window)
 
-	return fmt.Sprintf(fmtQuery, baseMetric, fmtWindow, fmtOffset, env.GetPromClusterLabel(), localStorageCost)
+	return fmt.Sprintf(fmtQuery, baseMetric, env.GetPromClusterFilter(), fmtWindow, fmtOffset, env.GetPromClusterLabel(), localStorageCost)
 }
 
 func (gcp *GCP) GetConfig() (*models.CustomPricing, error) {
@@ -276,6 +288,7 @@ func (gcp *GCP) UpdateConfig(r io.Reader, updateType string) (*models.CustomPric
 			c.AthenaBucketName = a.AthenaBucketName
 			c.AthenaRegion = a.AthenaRegion
 			c.AthenaDatabase = a.AthenaDatabase
+			c.AthenaCatalog = a.AthenaCatalog
 			c.AthenaTable = a.AthenaTable
 			c.AthenaWorkgroup = a.AthenaWorkgroup
 			c.ServiceKeyName = a.ServiceKeyName
@@ -336,7 +349,7 @@ func (gcp *GCP) ClusterInfo() (map[string]string, error) {
 
 	m := make(map[string]string)
 	m["name"] = attribute
-	m["provider"] = kubecost.GCPProvider
+	m["provider"] = opencost.GCPProvider
 	m["region"] = gcp.ClusterRegion
 	m["account"] = gcp.ClusterAccountID
 	m["project"] = gcp.ClusterProjectID
@@ -481,7 +494,8 @@ func (gcp *GCP) GetOrphanedResources() ([]models.OrphanedResource, error) {
 				desc := map[string]string{}
 				if disk.Description != "" {
 					if err := json.Unmarshal([]byte(disk.Description), &desc); err != nil {
-						return nil, fmt.Errorf("error converting string to map: %s", err)
+						log.Errorf("ignoring orphaned disk %s, failed to convert disk description to map: %s", disk.Name, err)
+						continue
 					}
 				}
 
@@ -627,7 +641,17 @@ func (gcp *GCP) parsePage(r io.Reader, inputKeys map[string]models.Key, pvKeys m
 		if err == io.EOF {
 			break
 		} else if err != nil {
-			return nil, "", fmt.Errorf("Error parsing GCP pricing page: %s", err)
+			return nil, "", fmt.Errorf("error parsing GCP pricing page: %s", err)
+		}
+		if t == "error" {
+			errReader := dec.Buffered()
+			buf := new(strings.Builder)
+			_, err = io.Copy(buf, errReader)
+			if err != nil {
+				return nil, "", fmt.Errorf("error respnse: could not be read %s", err)
+			}
+
+			return nil, "", fmt.Errorf("error respnse: %s", buf.String())
 		}
 		if t == "skus" {
 			_, err := dec.Token() // consumes [
@@ -760,19 +784,29 @@ func (gcp *GCP) parsePage(r io.Reader, inputKeys map[string]models.Key, pvKeys m
 				partialCPUMap["e2micro"] = 0.25
 				partialCPUMap["e2small"] = 0.5
 				partialCPUMap["e2medium"] = 1
-				/*
-					var partialCPU float64
-					if strings.ToLower(instanceType) == "f1micro" {
-						partialCPU = 0.2
-					} else if strings.ToLower(instanceType) == "g1small" {
-						partialCPU = 0.5
-					}
-				*/
+
+				if (instanceType == "ram" || instanceType == "cpu") && strings.Contains(strings.ToUpper(product.Description), "T2D AMD") {
+					instanceType = "t2dstandard"
+				}
+				if (instanceType == "ram" || instanceType == "cpu") && strings.Contains(strings.ToUpper(product.Description), "T2A ARM") {
+					instanceType = "t2astandard"
+				}
+
 				var gpuType string
-				for matchnum, group := range nvidiaGPURegex.FindStringSubmatch(product.Description) {
+				for matchnum, group := range nvidiaTeslaGPURegex.FindStringSubmatch(product.Description) {
 					if matchnum == 1 {
 						gpuType = strings.ToLower(strings.Join(strings.Split(group, " "), "-"))
-						log.Debug("GPU type found: " + gpuType)
+						log.Debugf("GCP Billing API: GPU type found: '%s'", gpuType)
+					}
+				}
+
+				// If a 'Nvidia Tesla' is not found, try 'Nvidia'
+				if gpuType == "" {
+					for matchnum, group := range nvidiaGPURegex.FindStringSubmatch(product.Description) {
+						if matchnum == 1 {
+							gpuType = strings.ToLower(strings.Join(strings.Split(group, " "), "-"))
+							log.Debugf("GCP Billing API: GPU type found: '%s'", gpuType)
+						}
 					}
 				}
 
@@ -792,6 +826,7 @@ func (gcp *GCP) parsePage(r io.Reader, inputKeys map[string]models.Key, pvKeys m
 					case "a2":
 						candidateKeys = append(candidateKeys, region+","+"a2highgpu"+","+usageType)
 						candidateKeys = append(candidateKeys, region+","+"a2megagpu"+","+usageType)
+						candidateKeys = append(candidateKeys, region+","+"a2ultragpu"+","+usageType)
 					default:
 						candidateKey := region + "," + instanceType + "," + usageType
 						candidateKeys = append(candidateKeys, candidateKey)
@@ -826,16 +861,15 @@ func (gcp *GCP) parsePage(r io.Reader, inputKeys map[string]models.Key, pvKeys m
 						// (E.g., SKU "2013-37B4-22EA")
 						// and are excluded from cost computations
 						if hourlyPrice == 0 {
-							log.Infof("Excluding reserved GPU SKU #%s", product.SKUID)
+							log.Debugf("GCP Billing API: excluding reserved GPU SKU #%s", product.SKUID)
 							continue
 						}
 
 						for k, key := range inputKeys {
 							if key.GPUType() == gpuType+","+usageType {
 								if region == strings.Split(k, ",")[0] {
-									log.Infof("Matched GPU to node in region \"%s\"", region)
-									log.Debugf("PRODUCT DESCRIPTION: %s", product.Description)
 									matchedKey := key.Features()
+									log.Debugf("GCP Billing API: matched GPU to node: %s: %s", matchedKey, product.Description)
 									if pl, ok := gcpPricingList[matchedKey]; ok {
 										pl.Node.GPUName = gpuType
 										pl.Node.GPUCost = strconv.FormatFloat(hourlyPrice, 'f', -1, 64)
@@ -848,7 +882,6 @@ func (gcp *GCP) parsePage(r io.Reader, inputKeys map[string]models.Key, pvKeys m
 										}
 										gcpPricingList[matchedKey] = product
 									}
-									log.Infof("Added data for " + matchedKey)
 								}
 							}
 						}
@@ -856,14 +889,18 @@ func (gcp *GCP) parsePage(r io.Reader, inputKeys map[string]models.Key, pvKeys m
 						_, ok := inputKeys[candidateKey]
 						_, ok2 := inputKeys[candidateKeyGPU]
 						if ok || ok2 {
-							lastRateIndex := len(product.PricingInfo[0].PricingExpression.TieredRates) - 1
 							var nanos float64
 							var unitsBaseCurrency int
-							if lastRateIndex > -1 && len(product.PricingInfo) > 0 {
-								nanos = product.PricingInfo[0].PricingExpression.TieredRates[lastRateIndex].UnitPrice.Nanos
-								unitsBaseCurrency, err = strconv.Atoi(product.PricingInfo[0].PricingExpression.TieredRates[lastRateIndex].UnitPrice.Units)
-								if err != nil {
-									return nil, "", fmt.Errorf("error parsing base unit price for instance: %w", err)
+							if len(product.PricingInfo) > 0 {
+								lastRateIndex := len(product.PricingInfo[0].PricingExpression.TieredRates) - 1
+								if lastRateIndex >= 0 {
+									nanos = product.PricingInfo[0].PricingExpression.TieredRates[lastRateIndex].UnitPrice.Nanos
+									unitsBaseCurrency, err = strconv.Atoi(product.PricingInfo[0].PricingExpression.TieredRates[lastRateIndex].UnitPrice.Units)
+									if err != nil {
+										return nil, "", fmt.Errorf("error parsing base unit price for instance: %w", err)
+									}
+								} else {
+									continue
 								}
 							} else {
 								continue
@@ -877,69 +914,73 @@ func (gcp *GCP) parsePage(r io.Reader, inputKeys map[string]models.Key, pvKeys m
 								continue
 							} else if strings.Contains(strings.ToUpper(product.Description), "RAM") {
 								if instanceType == "custom" {
-									log.Debug("RAM custom sku is: " + product.Name)
+									log.Debugf("GCP Billing API: RAM custom sku '%s'", product.Name)
 								}
 								if _, ok := gcpPricingList[candidateKey]; ok {
+									log.Debugf("GCP Billing API: key '%s': RAM price: %f", candidateKey, hourlyPrice)
 									gcpPricingList[candidateKey].Node.RAMCost = strconv.FormatFloat(hourlyPrice, 'f', -1, 64)
 								} else {
-									product = &GCPPricing{}
-									product.Node = &models.Node{
+									log.Debugf("GCP Billing API: key '%s': RAM price: %f", candidateKey, hourlyPrice)
+									pricing := &GCPPricing{}
+									pricing.Node = &models.Node{
 										RAMCost: strconv.FormatFloat(hourlyPrice, 'f', -1, 64),
 									}
 									partialCPU, pcok := partialCPUMap[instanceType]
 									if pcok {
-										product.Node.VCPU = fmt.Sprintf("%f", partialCPU)
+										pricing.Node.VCPU = fmt.Sprintf("%f", partialCPU)
 									}
-									product.Node.UsageType = usageType
-									gcpPricingList[candidateKey] = product
+									pricing.Node.UsageType = usageType
+									gcpPricingList[candidateKey] = pricing
 								}
 								if _, ok := gcpPricingList[candidateKeyGPU]; ok {
-									log.Infof("Adding RAM %f for %s", hourlyPrice, candidateKeyGPU)
+									log.Debugf("GCP Billing API: key '%s': RAM price: %f", candidateKeyGPU, hourlyPrice)
 									gcpPricingList[candidateKeyGPU].Node.RAMCost = strconv.FormatFloat(hourlyPrice, 'f', -1, 64)
 								} else {
-									log.Infof("Adding RAM %f for %s", hourlyPrice, candidateKeyGPU)
-									product = &GCPPricing{}
-									product.Node = &models.Node{
+									log.Debugf("GCP Billing API: key '%s': RAM price: %f", candidateKeyGPU, hourlyPrice)
+									pricing := &GCPPricing{}
+									pricing.Node = &models.Node{
 										RAMCost: strconv.FormatFloat(hourlyPrice, 'f', -1, 64),
 									}
 									partialCPU, pcok := partialCPUMap[instanceType]
 									if pcok {
-										product.Node.VCPU = fmt.Sprintf("%f", partialCPU)
+										pricing.Node.VCPU = fmt.Sprintf("%f", partialCPU)
 									}
-									product.Node.UsageType = usageType
-									gcpPricingList[candidateKeyGPU] = product
+									pricing.Node.UsageType = usageType
+									gcpPricingList[candidateKeyGPU] = pricing
 								}
-								break
 							} else {
 								if _, ok := gcpPricingList[candidateKey]; ok {
+									log.Debugf("GCP Billing API: key '%s': CPU price: %f", candidateKey, hourlyPrice)
 									gcpPricingList[candidateKey].Node.VCPUCost = strconv.FormatFloat(hourlyPrice, 'f', -1, 64)
 								} else {
-									product = &GCPPricing{}
-									product.Node = &models.Node{
+									log.Debugf("GCP Billing API: key '%s': CPU price: %f", candidateKey, hourlyPrice)
+									pricing := &GCPPricing{}
+									pricing.Node = &models.Node{
 										VCPUCost: strconv.FormatFloat(hourlyPrice, 'f', -1, 64),
 									}
 									partialCPU, pcok := partialCPUMap[instanceType]
 									if pcok {
-										product.Node.VCPU = fmt.Sprintf("%f", partialCPU)
+										pricing.Node.VCPU = fmt.Sprintf("%f", partialCPU)
 									}
-									product.Node.UsageType = usageType
-									gcpPricingList[candidateKey] = product
+									pricing.Node.UsageType = usageType
+									gcpPricingList[candidateKey] = pricing
 								}
 								if _, ok := gcpPricingList[candidateKeyGPU]; ok {
+									log.Debugf("GCP Billing API: key '%s': CPU price: %f", candidateKeyGPU, hourlyPrice)
 									gcpPricingList[candidateKeyGPU].Node.VCPUCost = strconv.FormatFloat(hourlyPrice, 'f', -1, 64)
 								} else {
-									product = &GCPPricing{}
-									product.Node = &models.Node{
+									log.Debugf("GCP Billing API: key '%s': CPU price: %f", candidateKeyGPU, hourlyPrice)
+									pricing := &GCPPricing{}
+									pricing.Node = &models.Node{
 										VCPUCost: strconv.FormatFloat(hourlyPrice, 'f', -1, 64),
 									}
 									partialCPU, pcok := partialCPUMap[instanceType]
 									if pcok {
-										product.Node.VCPU = fmt.Sprintf("%f", partialCPU)
+										pricing.Node.VCPU = fmt.Sprintf("%f", partialCPU)
 									}
-									product.Node.UsageType = usageType
-									gcpPricingList[candidateKeyGPU] = product
+									pricing.Node.UsageType = usageType
+									gcpPricingList[candidateKeyGPU] = pricing
 								}
-								break
 							}
 						}
 					}
@@ -962,14 +1003,19 @@ func (gcp *GCP) parsePage(r io.Reader, inputKeys map[string]models.Key, pvKeys m
 	return gcpPricingList, nextPageToken, nil
 }
 
+func (gcp *GCP) getBillingAPIURL(apiKey, currencyCode string) string {
+	return fmt.Sprintf(BillingAPIURLFmt, apiKey, currencyCode)
+}
+
 func (gcp *GCP) parsePages(inputKeys map[string]models.Key, pvKeys map[string]models.PVKey) (map[string]*GCPPricing, error) {
 	var pages []map[string]*GCPPricing
 	c, err := gcp.GetConfig()
 	if err != nil {
 		return nil, err
 	}
-	url := "https://cloudbilling.googleapis.com/v1/services/6F81-5844-456A/skus?key=" + gcp.APIKey + "&currencyCode=" + c.CurrencyCode
-	log.Infof("Fetch GCP Billing Data from URL: %s", url)
+
+	url := gcp.getBillingAPIURL(gcp.APIKey, c.CurrencyCode)
+
 	var parsePagesHelper func(string) error
 	parsePagesHelper = func(pageToken string) error {
 		if pageToken == "done" {
@@ -1019,6 +1065,7 @@ func (gcp *GCP) parsePages(inputKeys map[string]models.Key, pvKeys map[string]mo
 			}
 		}
 	}
+
 	log.Debugf("ALL PAGES: %+v", returnPages)
 	for k, v := range returnPages {
 		if v.Node != nil {
@@ -1051,7 +1098,7 @@ func (gcp *GCP) DownloadPricingData() error {
 
 	defaultRegion := "" // Sometimes, PVs may be missing the region label. In that case assume that they are in the same region as the nodes
 	for _, n := range nodeList {
-		labels := n.GetObjectMeta().GetLabels()
+		labels := n.Labels
 		if _, ok := labels["cloud.google.com/gke-nodepool"]; ok { // The node is part of a GKE nodepool, so you're paying a cluster management cost
 			gcp.clusterManagementPrice = 0.10
 			gcp.clusterProvisioner = "GKE"
@@ -1069,8 +1116,8 @@ func (gcp *GCP) DownloadPricingData() error {
 	storageClassMap := make(map[string]map[string]string)
 	for _, storageClass := range storageClasses {
 		params := storageClass.Parameters
-		storageClassMap[storageClass.ObjectMeta.Name] = params
-		if storageClass.GetAnnotations()["storageclass.kubernetes.io/is-default-class"] == "true" || storageClass.GetAnnotations()["storageclass.beta.kubernetes.io/is-default-class"] == "true" {
+		storageClassMap[storageClass.Name] = params
+		if storageClass.Annotations["storageclass.kubernetes.io/is-default-class"] == "true" || storageClass.Annotations["storageclass.beta.kubernetes.io/is-default-class"] == "true" {
 			storageClassMap["default"] = params
 			storageClassMap[""] = params
 		}
@@ -1110,12 +1157,16 @@ func (gcp *GCP) DownloadPricingData() error {
 	return nil
 }
 
+func (gcp *GCP) GpuPricing(nodeLabels map[string]string) (string, error) {
+	return "", nil
+}
+
 func (gcp *GCP) PVPricing(pvk models.PVKey) (*models.PV, error) {
 	gcp.DownloadPricingDataLock.RLock()
 	defer gcp.DownloadPricingDataLock.RUnlock()
 	pricing, ok := gcp.Pricing[pvk.Features()]
 	if !ok {
-		log.Infof("Persistent Volume pricing not found for %s: %s", pvk.GetStorageClass(), pvk.Features())
+		log.Debugf("Persistent Volume pricing not found for %s: %s", pvk.GetStorageClass(), pvk.Features())
 		return &models.PV{}, nil
 	}
 	return pricing.PV, nil
@@ -1248,12 +1299,12 @@ func (gcp *GCP) ApplyReservedInstancePricing(nodes map[string]*models.Node) {
 		}
 	}
 
-	gcpNodes := make(map[string]*v1.Node)
+	gcpNodes := make(map[string]*clustercache.Node)
 	currentNodes := gcp.Clientset.GetAllNodes()
 
 	// Create a node name -> node map
 	for _, gcpNode := range currentNodes {
-		gcpNodes[gcpNode.GetName()] = gcpNode
+		gcpNodes[gcpNode.Name] = gcpNode
 	}
 
 	// go through all provider nodes using k8s nodes for region
@@ -1405,7 +1456,7 @@ func (key *pvKey) GetStorageClass() string {
 	return key.StorageClass
 }
 
-func (gcp *GCP) GetPVKey(pv *v1.PersistentVolume, parameters map[string]string, defaultRegion string) models.PVKey {
+func (gcp *GCP) GetPVKey(pv *clustercache.PersistentVolume, parameters map[string]string, defaultRegion string) models.PVKey {
 	providerID := ""
 	if pv.Spec.GCEPersistentDisk != nil {
 		providerID = pv.Spec.GCEPersistentDisk.PDName
@@ -1444,7 +1495,7 @@ type gcpKey struct {
 	Labels map[string]string
 }
 
-func (gcp *GCP) GetKey(labels map[string]string, n *v1.Node) models.Key {
+func (gcp *GCP) GetKey(labels map[string]string, n *clustercache.Node) models.Key {
 	return &gcpKey{
 		Labels: labels,
 	}
@@ -1539,25 +1590,57 @@ func (gcp *GCP) isValidPricingKey(key models.Key) bool {
 }
 
 // NodePricing returns GCP pricing data for a single node
-func (gcp *GCP) NodePricing(key models.Key) (*models.Node, error) {
+func (gcp *GCP) NodePricing(key models.Key) (*models.Node, models.PricingMetadata, error) {
+	meta := models.PricingMetadata{}
+
+	c, err := gcp.Config.GetCustomPricingData()
+	if err != nil {
+		meta.Warnings = append(meta.Warnings, fmt.Sprintf("failed to detect currency: %s", err))
+	} else {
+		meta.Currency = c.CurrencyCode
+	}
+
 	if n, ok := gcp.getPricing(key); ok {
 		log.Debugf("Returning pricing for node %s: %+v from SKU %s", key, n.Node, n.Name)
+
+		// Add pricing URL, but redact the key (hence, "***"")
+		meta.Source = fmt.Sprintf("Downloaded pricing from %s", gcp.getBillingAPIURL("***", c.CurrencyCode))
+
 		n.Node.BaseCPUPrice = gcp.BaseCPUPrice
-		return n.Node, nil
+
+		return n.Node, meta, nil
 	} else if ok := gcp.isValidPricingKey(key); ok {
+		meta.Warnings = append(meta.Warnings, fmt.Sprintf("No pricing found, but key is valid: %s", key.Features()))
+
 		err := gcp.DownloadPricingData()
 		if err != nil {
-			return nil, fmt.Errorf("Download pricing data failed: %s", err.Error())
+			log.Warnf("no pricing data found for %s", key.Features())
+
+			meta.Warnings = append(meta.Warnings, "Failed to download pricing data")
+
+			return nil, meta, fmt.Errorf("failed to download pricing data: %w", err)
 		}
 		if n, ok := gcp.getPricing(key); ok {
 			log.Debugf("Returning pricing for node %s: %+v from SKU %s", key, n.Node, n.Name)
+
+			// Add pricing URL, but redact the key (hence, "***"")
+			meta.Source = fmt.Sprintf("Downloaded pricing from %s", gcp.getBillingAPIURL("***", c.CurrencyCode))
+
 			n.Node.BaseCPUPrice = gcp.BaseCPUPrice
-			return n.Node, nil
+
+			return n.Node, meta, nil
 		}
-		log.Warnf("no pricing data found for %s: %s", key.Features(), key)
-		return nil, fmt.Errorf("Warning: no pricing data found for %s", key)
+
+		log.Warnf("no pricing data found for %s", key.Features())
+
+		meta.Warnings = append(meta.Warnings, "Failed to find pricing after downloading data, but key is valid")
+
+		return nil, meta, fmt.Errorf("failed to find pricing data: %s", key.Features())
 	}
-	return nil, fmt.Errorf("Warning: no pricing data found for %s", key)
+
+	meta.Warnings = append(meta.Warnings, fmt.Sprintf("No pricing found, and key is not valid: %s", key.Features()))
+
+	return nil, meta, fmt.Errorf("no pricing data found for %s", key.Features())
 }
 
 func (gcp *GCP) ServiceAccountStatus() *models.ServiceAccountStatus {
