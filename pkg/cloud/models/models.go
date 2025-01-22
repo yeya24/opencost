@@ -3,16 +3,16 @@ package models
 import (
 	"fmt"
 	"io"
+	"math"
 	"reflect"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/microcosm-cc/bluemonday"
-	v1 "k8s.io/api/core/v1"
-
+	"github.com/opencost/opencost/core/pkg/log"
+	"github.com/opencost/opencost/pkg/clustercache"
 	"github.com/opencost/opencost/pkg/config"
-	"github.com/opencost/opencost/pkg/log"
 )
 
 var (
@@ -55,11 +55,13 @@ type Node struct {
 	GPU              string                `json:"gpu"` // GPU represents the number of GPU on the instance
 	GPUName          string                `json:"gpuName"`
 	GPUCost          string                `json:"gpuCost"`
+	VGPU             string                `json:"vgpu"` // virtualized gpu-- if we are using gpu replicas
 	InstanceType     string                `json:"instanceType,omitempty"`
 	Region           string                `json:"region,omitempty"`
 	Reserved         *ReservedInstanceData `json:"reserved,omitempty"`
 	ProviderID       string                `json:"providerID,omitempty"`
 	PricingType      PricingType           `json:"pricingType,omitempty"`
+	ArchType         string                `json:"archType,omitempty"`
 }
 
 // IsSpot determines whether or not a Node uses spot by usage type
@@ -158,6 +160,7 @@ type CustomPricing struct {
 	AthenaBucketName             string `json:"athenaBucketName"`
 	AthenaRegion                 string `json:"athenaRegion"`
 	AthenaDatabase               string `json:"athenaDatabase"`
+	AthenaCatalog                string `json:"athenaCatalog"`
 	AthenaTable                  string `json:"athenaTable"`
 	AthenaWorkgroup              string `json:"athenaWorkgroup"`
 	MasterPayerARN               string `json:"masterPayerARN"`
@@ -214,24 +217,57 @@ func (cp *CustomPricing) GetSharedOverheadCostPerMonth() float64 {
 	return sharedCostPerMonth
 }
 
-func SetCustomPricingField(obj *CustomPricing, name string, value string) error {
+func sanitizeFloatString(number string, allowNaN bool) (string, error) {
+	num, err := strconv.ParseFloat(number, 64)
+	if err != nil {
+		return "", fmt.Errorf("expected a string representing a number; got '%s'", number)
+	}
+	if !allowNaN && math.IsNaN(num) {
+		return "", fmt.Errorf("expected a string representing a number; got 'NaN'")
+	}
 
+	// Format the numerical string we just parsed.
+	return strconv.FormatFloat(num, 'f', -1, 64), nil
+}
+
+func SetCustomPricingField(obj *CustomPricing, name string, value string) error {
 	structValue := reflect.ValueOf(obj).Elem()
 	structFieldValue := structValue.FieldByName(name)
 
 	if !structFieldValue.IsValid() {
-		return fmt.Errorf("No such field: %s in obj", name)
+		return fmt.Errorf("no such field: %s in obj", name)
 	}
 
 	if !structFieldValue.CanSet() {
-		return fmt.Errorf("Cannot set %s field value", name)
+		return fmt.Errorf("cannot set %s field value", name)
+	}
+
+	// If the custom pricing field is expected to be a string representation
+	// of a floating point number, e.g. a resource price, then do some extra
+	// validation work in order to prevent "NaN" and other invalid strings
+	// from getting set here.
+	switch strings.ToLower(name) {
+	case "cpu", "gpu", "ram", "spotcpu", "spotgpu", "spotram", "storage", "zonenetworkegress", "regionnetworkegress", "internetnetworkegress":
+		// If we are sent an empty string, ignore the key and don't change the value
+		if value == "" {
+			return nil
+		} else {
+			// Validate that "value" represents a real floating point number, and
+			// set precision, bits, etc. Do not allow NaN.
+			val, err := sanitizeFloatString(value, false)
+			if err != nil {
+				return fmt.Errorf("invalid numeric value for field '%s': %s", name, value)
+			}
+			value = val
+		}
+	default:
 	}
 
 	structFieldType := structFieldValue.Type()
 	value = sanitizePolicy.Sanitize(value)
 	val := reflect.ValueOf(value)
 	if structFieldType != val.Type() {
-		return fmt.Errorf("Provided value type didn't match custom pricing field type")
+		return fmt.Errorf("provided value type didn't match custom pricing field type")
 	}
 
 	structFieldValue.Set(val)
@@ -272,14 +308,15 @@ type Provider interface {
 	GetAddresses() ([]byte, error)
 	GetDisks() ([]byte, error)
 	GetOrphanedResources() ([]OrphanedResource, error)
-	NodePricing(Key) (*Node, error)
+	NodePricing(Key) (*Node, PricingMetadata, error)
+	GpuPricing(map[string]string) (string, error)
 	PVPricing(PVKey) (*PV, error)
 	NetworkPricing() (*Network, error)           // TODO: add key interface arg for dynamic price fetching
 	LoadBalancerPricing() (*LoadBalancer, error) // TODO: add key interface arg for dynamic price fetching
 	AllNodePricing() (interface{}, error)
 	DownloadPricingData() error
-	GetKey(map[string]string, *v1.Node) Key
-	GetPVKey(*v1.PersistentVolume, map[string]string, string) PVKey
+	GetKey(map[string]string, *clustercache.Node) Key
+	GetPVKey(*clustercache.PersistentVolume, map[string]string, string) PVKey
 	UpdateConfig(r io.Reader, updateType string) (*CustomPricing, error)
 	UpdateConfigFromConfigMap(map[string]string) (*CustomPricing, error)
 	GetConfig() (*CustomPricing, error)

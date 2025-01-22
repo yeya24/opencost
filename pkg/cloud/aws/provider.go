@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,18 +16,20 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aws/smithy-go"
 	"github.com/opencost/opencost/pkg/cloud/models"
 	"github.com/opencost/opencost/pkg/cloud/utils"
-	"github.com/opencost/opencost/pkg/kubecost"
 
+	"github.com/opencost/opencost/core/pkg/env"
+	"github.com/opencost/opencost/core/pkg/log"
+	"github.com/opencost/opencost/core/pkg/opencost"
+	"github.com/opencost/opencost/core/pkg/util"
+	"github.com/opencost/opencost/core/pkg/util/fileutil"
+	"github.com/opencost/opencost/core/pkg/util/json"
+	"github.com/opencost/opencost/core/pkg/util/timeutil"
 	"github.com/opencost/opencost/pkg/clustercache"
-	"github.com/opencost/opencost/pkg/env"
+	ocenv "github.com/opencost/opencost/pkg/env"
 	errs "github.com/opencost/opencost/pkg/errors"
-	"github.com/opencost/opencost/pkg/log"
-	"github.com/opencost/opencost/pkg/util"
-	"github.com/opencost/opencost/pkg/util/fileutil"
-	"github.com/opencost/opencost/pkg/util/json"
-	"github.com/opencost/opencost/pkg/util/timeutil"
 
 	awsSDK "github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -40,8 +43,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 
 	"github.com/jszwec/csvutil"
-
-	v1 "k8s.io/api/core/v1"
 )
 
 const (
@@ -68,6 +69,13 @@ var (
 	usageTypeRegx = regexp.MustCompile(".*(-|^)(EBS.+)")
 	versionRx     = regexp.MustCompile(`^#Version: (\\d+)\\.\\d+$`)
 	regionRx      = regexp.MustCompile("([a-z]+-[a-z]+-[0-9])")
+
+	// StorageClassProvisionerDefaults specifies the default storage class types depending upon the provisioner
+	StorageClassProvisionerDefaults = map[string]string{
+		"kubernetes.io/aws-ebs": "gp2",
+		"ebs.csi.aws.com":       "gp3",
+		// TODO: add efs provisioner
+	}
 )
 
 func (aws *AWS) PricingSourceStatus() map[string]*models.PricingSource {
@@ -146,6 +154,7 @@ var awsRegions = []string{
 	"af-south-1",
 	"us-gov-east-1",
 	"us-gov-west-1",
+	"me-central-1",
 }
 
 // AWS represents an Amazon Provider
@@ -238,6 +247,8 @@ type AWSProduct struct {
 // AWSProductAttributes represents metadata about the product used to map to a node.
 type AWSProductAttributes struct {
 	Location        string `json:"location"`
+	RegionCode      string `json:"regionCode"`
+	Operation       string `json:"operation"`
 	InstanceType    string `json:"instanceType"`
 	Memory          string `json:"memory"`
 	Storage         string `json:"storage"`
@@ -248,6 +259,7 @@ type AWSProductAttributes struct {
 	InstanceFamily  string `json:"instanceFamily"`
 	CapacityStatus  string `json:"capacitystatus"`
 	GPU             string `json:"gpu"` // GPU represents the number of GPU on the instance
+	MarketOption    string `json:"marketOption"`
 }
 
 // AWSPricingTerms are how you pay for the node: OnDemand, Reserved, or (TODO) Spot
@@ -289,14 +301,15 @@ type AWSCurrencyCode struct {
 
 // AWSProductTerms represents the full terms of the product
 type AWSProductTerms struct {
-	Sku      string        `json:"sku"`
-	OnDemand *AWSOfferTerm `json:"OnDemand"`
-	Reserved *AWSOfferTerm `json:"Reserved"`
-	Memory   string        `json:"memory"`
-	Storage  string        `json:"storage"`
-	VCpu     string        `json:"vcpu"`
-	GPU      string        `json:"gpu"` // GPU represents the number of GPU on the instance
-	PV       *models.PV    `json:"pv"`
+	Sku          string               `json:"sku"`
+	OnDemand     *AWSOfferTerm        `json:"OnDemand"`
+	Reserved     *AWSOfferTerm        `json:"Reserved"`
+	Memory       string               `json:"memory"`
+	Storage      string               `json:"storage"`
+	VCpu         string               `json:"vcpu"`
+	GPU          string               `json:"gpu"` // GPU represents the number of GPU on the instance
+	PV           *models.PV           `json:"pv"`
+	LoadBalancer *models.LoadBalancer `json:"load_balancer"`
 }
 
 // ClusterIdEnvVar is the environment variable in which one can manually set the ClusterId
@@ -336,36 +349,6 @@ var volTypes = map[string]string{
 	"st1":                    "EBS:VolumeUsage.st1",
 }
 
-// locationToRegion maps AWS region names (As they come from Billing)
-// to actual region identifiers
-var locationToRegion = map[string]string{
-	"US East (Ohio)":            "us-east-2",
-	"US East (N. Virginia)":     "us-east-1",
-	"US West (N. California)":   "us-west-1",
-	"US West (Oregon)":          "us-west-2",
-	"Asia Pacific (Hong Kong)":  "ap-east-1",
-	"Asia Pacific (Mumbai)":     "ap-south-1",
-	"Asia Pacific (Osaka)":      "ap-northeast-3",
-	"Asia Pacific (Seoul)":      "ap-northeast-2",
-	"Asia Pacific (Singapore)":  "ap-southeast-1",
-	"Asia Pacific (Sydney)":     "ap-southeast-2",
-	"Asia Pacific (Tokyo)":      "ap-northeast-1",
-	"Asia Pacific (Jakarta)":    "ap-southeast-3",
-	"Canada (Central)":          "ca-central-1",
-	"China (Beijing)":           "cn-north-1",
-	"China (Ningxia)":           "cn-northwest-1",
-	"EU (Frankfurt)":            "eu-central-1",
-	"EU (Ireland)":              "eu-west-1",
-	"EU (London)":               "eu-west-2",
-	"EU (Paris)":                "eu-west-3",
-	"EU (Stockholm)":            "eu-north-1",
-	"EU (Milan)":                "eu-south-1",
-	"South America (Sao Paulo)": "sa-east-1",
-	"Africa (Cape Town)":        "af-south-1",
-	"AWS GovCloud (US-East)":    "us-gov-east-1",
-	"AWS GovCloud (US-West)":    "us-gov-west-1",
-}
-
 var loadedAWSSecret bool = false
 var awsSecret *AWSAccessKey = nil
 
@@ -373,11 +356,10 @@ func (aws *AWS) GetLocalStorageQuery(window, offset time.Duration, rate bool, us
 	return ""
 }
 
-// KubeAttrConversion maps the k8s labels for region to an aws region
-func (aws *AWS) KubeAttrConversion(location, instanceType, operatingSystem string) string {
+// KubeAttrConversion maps the k8s labels for region to an AWS key
+func (aws *AWS) KubeAttrConversion(region, instanceType, operatingSystem string) string {
 	operatingSystem = strings.ToLower(operatingSystem)
 
-	region := locationToRegion[location]
 	return region + "," + instanceType + "," + operatingSystem
 }
 
@@ -399,6 +381,7 @@ type AwsAthenaInfo struct {
 	AthenaBucketName string `json:"athenaBucketName"`
 	AthenaRegion     string `json:"athenaRegion"`
 	AthenaDatabase   string `json:"athenaDatabase"`
+	AthenaCatalog    string `json:"athenaCatalog"`
 	AthenaTable      string `json:"athenaTable"`
 	AthenaWorkgroup  string `json:"athenaWorkgroup"`
 	ServiceKeyName   string `json:"serviceKeyName"`
@@ -412,6 +395,7 @@ func (aai *AwsAthenaInfo) IsEmpty() bool {
 	return aai.AthenaBucketName == "" &&
 		aai.AthenaRegion == "" &&
 		aai.AthenaDatabase == "" &&
+		aai.AthenaCatalog == "" &&
 		aai.AthenaTable == "" &&
 		aai.AthenaWorkgroup == "" &&
 		aai.ServiceKeyName == "" &&
@@ -483,10 +467,10 @@ func (aws *AWS) GetAWSAccessKey() (*AWSAccessKey, error) {
 	}
 	//Look for service key values in env if not present in config
 	if config.ServiceKeyName == "" {
-		config.ServiceKeyName = env.GetAWSAccessKeyID()
+		config.ServiceKeyName = ocenv.GetAWSAccessKeyID()
 	}
 	if config.ServiceKeySecret == "" {
-		config.ServiceKeySecret = env.GetAWSAccessKeySecret()
+		config.ServiceKeySecret = ocenv.GetAWSAccessKeySecret()
 	}
 
 	if config.ServiceKeyName == "" && config.ServiceKeySecret == "" {
@@ -512,6 +496,7 @@ func (aws *AWS) GetAWSAthenaInfo() (*AwsAthenaInfo, error) {
 		AthenaBucketName: config.AthenaBucketName,
 		AthenaRegion:     config.AthenaRegion,
 		AthenaDatabase:   config.AthenaDatabase,
+		AthenaCatalog:    config.AthenaCatalog,
 		AthenaTable:      config.AthenaTable,
 		AthenaWorkgroup:  config.AthenaWorkgroup,
 		ServiceKeyName:   aak.AccessKeyID,
@@ -534,6 +519,12 @@ func (aws *AWS) UpdateConfig(r io.Reader, updateType string) (*models.CustomPric
 				return err
 			}
 
+			// If the sample nil service key name is set, zero it out so that it is not
+			// misinterpreted as a real service key.
+			if asfi.ServiceKeyName == "AKIXXX" {
+				asfi.ServiceKeyName = ""
+			}
+
 			c.ServiceKeyName = asfi.ServiceKeyName
 			if asfi.ServiceKeySecret != "" {
 				c.ServiceKeySecret = asfi.ServiceKeySecret
@@ -551,9 +542,17 @@ func (aws *AWS) UpdateConfig(r io.Reader, updateType string) (*models.CustomPric
 			if err != nil {
 				return err
 			}
+
+			// If the sample nil service key name is set, zero it out so that it is not
+			// misinterpreted as a real service key.
+			if aai.ServiceKeyName == "AKIXXX" {
+				aai.ServiceKeyName = ""
+			}
+
 			c.AthenaBucketName = aai.AthenaBucketName
 			c.AthenaRegion = aai.AthenaRegion
 			c.AthenaDatabase = aai.AthenaDatabase
+			c.AthenaCatalog = aai.AthenaCatalog
 			c.AthenaTable = aai.AthenaTable
 			c.AthenaWorkgroup = aai.AthenaWorkgroup
 			c.ServiceKeyName = aai.ServiceKeyName
@@ -576,7 +575,7 @@ func (aws *AWS) UpdateConfig(r io.Reader, updateType string) (*models.CustomPric
 				if ok {
 					err := models.SetCustomPricingField(c, kUpper, vstr)
 					if err != nil {
-						return err
+						return fmt.Errorf("error setting custom pricing field: %w", err)
 					}
 				} else {
 					return fmt.Errorf("type error while updating config for %s", kUpper)
@@ -584,8 +583,8 @@ func (aws *AWS) UpdateConfig(r io.Reader, updateType string) (*models.CustomPric
 			}
 		}
 
-		if env.IsRemoteEnabled() {
-			err := utils.UpdateClusterMeta(env.GetClusterID(), c.ClusterName)
+		if ocenv.IsRemoteEnabled() {
+			err := utils.UpdateClusterMeta(ocenv.GetClusterID(), c.ClusterName)
 			if err != nil {
 				return err
 			}
@@ -647,6 +646,9 @@ func (k *awsKey) Features() string {
 // If the instance is a spot instance, it will return PreemptibleType
 // Otherwise returns an empty string
 func (k *awsKey) getUsageType(labels map[string]string) string {
+	if kLabel, ok := labels[k.SpotLabelName]; ok && kLabel == k.SpotLabelValue {
+		return PreemptibleType
+	}
 	if eksLabel, ok := labels[EKSCapacityTypeLabel]; ok && eksLabel == EKSCapacitySpotTypeValue {
 		// We currently write out spot instances as "preemptible" in the pricing data, so these need to match
 		return PreemptibleType
@@ -655,6 +657,10 @@ func (k *awsKey) getUsageType(labels map[string]string) string {
 		return PreemptibleType
 	}
 	return ""
+}
+
+func (awsProvider *AWS) GpuPricing(nodeLabels map[string]string) (string, error) {
+	return "", nil
 }
 
 func (aws *AWS) PVPricing(pvk models.PVKey) (*models.PV, error) {
@@ -675,7 +681,7 @@ type awsPVKey struct {
 	ProviderID             string
 }
 
-func (aws *AWS) GetPVKey(pv *v1.PersistentVolume, parameters map[string]string, defaultRegion string) models.PVKey {
+func (aws *AWS) GetPVKey(pv *clustercache.PersistentVolume, parameters map[string]string, defaultRegion string) models.PVKey {
 	providerID := ""
 	if pv.Spec.AWSElasticBlockStore != nil {
 		providerID = pv.Spec.AWSElasticBlockStore.VolumeID
@@ -701,7 +707,12 @@ func (key *awsPVKey) GetStorageClass() string {
 }
 
 func (key *awsPVKey) Features() string {
-	storageClass := key.StorageClassParameters["type"]
+	storageClass, ok := key.StorageClassParameters["type"]
+	if !ok {
+		log.Debugf("storage class %s doesn't have a 'type' parameter", key.Name)
+		storageClass = getStorageClassTypeFrom(key.StorageClassParameters["provisioner"])
+	}
+
 	if storageClass == "standard" {
 		storageClass = "gp2"
 	}
@@ -719,8 +730,24 @@ func (key *awsPVKey) Features() string {
 	return region + "," + class
 }
 
+// getStorageClassTypeFrom returns the default ebs volume type for a provider provisioner
+func getStorageClassTypeFrom(provisioner string) string {
+	// if there isn't any provided provisioner, return empty volume type
+	if provisioner == "" {
+		return ""
+	}
+
+	scType, ok := StorageClassProvisionerDefaults[provisioner]
+	if ok {
+		log.Debugf("using default voltype %s for provisioner %s", scType, provisioner)
+		return scType
+	}
+
+	return ""
+}
+
 // GetKey maps node labels to information needed to retrieve pricing data
-func (aws *AWS) GetKey(labels map[string]string, n *v1.Node) models.Key {
+func (aws *AWS) GetKey(labels map[string]string, n *clustercache.Node) models.Key {
 	return &awsKey{
 		SpotLabelName:  aws.SpotLabelName,
 		SpotLabelValue: aws.SpotLabelValue,
@@ -742,13 +769,13 @@ func (aws *AWS) ClusterManagementPricing() (string, float64, error) {
 }
 
 // Use the pricing data from the current region. Fall back to using all region data if needed.
-func (aws *AWS) getRegionPricing(nodeList []*v1.Node) (*http.Response, string, error) {
+func (aws *AWS) getRegionPricing(nodeList []*clustercache.Node) (*http.Response, string, error) {
 
 	pricingURL := "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/"
 	region := ""
 	multiregion := false
 	for _, n := range nodeList {
-		labels := n.GetLabels()
+		labels := n.Labels
 		currentNodeRegion := ""
 		if r, ok := util.GetRegion(labels); ok {
 			currentNodeRegion = r
@@ -775,8 +802,8 @@ func (aws *AWS) getRegionPricing(nodeList []*v1.Node) (*http.Response, string, e
 
 	pricingURL += "index.json"
 
-	if env.GetAWSPricingURL() != "" { // Allow override of pricing URL
-		pricingURL = env.GetAWSPricingURL()
+	if ocenv.GetAWSPricingURL() != "" { // Allow override of pricing URL
+		pricingURL = ocenv.GetAWSPricingURL()
 	}
 
 	log.Infof("starting download of \"%s\", which is quite large ...", pricingURL)
@@ -832,7 +859,7 @@ func (aws *AWS) DownloadPricingData() error {
 			aws.clusterProvisioner = "KOPS"
 		}
 
-		labels := n.GetObjectMeta().GetLabels()
+		labels := n.Labels
 		key := aws.GetKey(labels, n)
 		inputkeys[key.Features()] = true
 	}
@@ -843,8 +870,11 @@ func (aws *AWS) DownloadPricingData() error {
 	storageClassMap := make(map[string]map[string]string)
 	for _, storageClass := range storageClasses {
 		params := storageClass.Parameters
-		storageClassMap[storageClass.ObjectMeta.Name] = params
-		if storageClass.GetAnnotations()["storageclass.kubernetes.io/is-default-class"] == "true" || storageClass.GetAnnotations()["storageclass.beta.kubernetes.io/is-default-class"] == "true" {
+		if params != nil {
+			params["provisioner"] = storageClass.Provisioner
+		}
+		storageClassMap[storageClass.Name] = params
+		if storageClass.Annotations["storageclass.kubernetes.io/is-default-class"] == "true" || storageClass.Annotations["storageclass.beta.kubernetes.io/is-default-class"] == "true" {
 			storageClassMap["default"] = params
 			storageClassMap[""] = params
 		}
@@ -975,8 +1005,9 @@ func (aws *AWS) populatePricing(resp *http.Response, inputkeys map[string]bool) 
 
 				if product.Attributes.PreInstalledSw == "NA" &&
 					(strings.HasPrefix(product.Attributes.UsageType, "BoxUsage") || strings.Contains(product.Attributes.UsageType, "-BoxUsage")) &&
-					product.Attributes.CapacityStatus == "Used" {
-					key := aws.KubeAttrConversion(product.Attributes.Location, product.Attributes.InstanceType, product.Attributes.OperatingSystem)
+					product.Attributes.CapacityStatus == "Used" &&
+					product.Attributes.MarketOption == "OnDemand" {
+					key := aws.KubeAttrConversion(product.Attributes.RegionCode, product.Attributes.InstanceType, product.Attributes.OperatingSystem)
 					spotKey := key + ",preemptible"
 					if inputkeys[key] || inputkeys[spotKey] { // Just grab the sku even if spot, and change the price later.
 						productTerms := &AWSProductTerms{
@@ -997,11 +1028,11 @@ func (aws *AWS) populatePricing(resp *http.Response, inputkeys map[string]bool) 
 					// volTypes to keep lookups generic
 					usageTypeMatch := usageTypeRegx.FindStringSubmatch(product.Attributes.UsageType)
 					usageTypeNoRegion := usageTypeMatch[len(usageTypeMatch)-1]
-					key := locationToRegion[product.Attributes.Location] + "," + usageTypeNoRegion
+					key := product.Attributes.RegionCode + "," + usageTypeNoRegion
 					spotKey := key + ",preemptible"
 					pv := &models.PV{
 						Class:  volTypes[usageTypeNoRegion],
-						Region: locationToRegion[product.Attributes.Location],
+						Region: product.Attributes.RegionCode,
 					}
 					productTerms := &AWSProductTerms{
 						Sku: product.Sku,
@@ -1012,6 +1043,19 @@ func (aws *AWS) populatePricing(resp *http.Response, inputkeys map[string]bool) 
 					skusToKeys[product.Sku] = key
 					aws.ValidPricingKeys[key] = true
 					aws.ValidPricingKeys[spotKey] = true
+				} else if strings.Contains(product.Attributes.UsageType, "LoadBalancerUsage") && product.Attributes.Operation == "LoadBalancing:Network" {
+					// since the costmodel is only using services of type LoadBalancer
+					// (and not ingresses controlled by AWS load balancer controller)
+					// we can safely filter for Network load balancers only
+					productTerms := &AWSProductTerms{
+						Sku:          product.Sku,
+						LoadBalancer: &models.LoadBalancer{},
+					}
+					// there is no spot pricing for load balancers
+					key := product.Attributes.RegionCode + ",LoadBalancerUsage"
+					aws.Pricing[key] = productTerms
+					skusToKeys[product.Sku] = key
+					aws.ValidPricingKeys[key] = true
 				}
 			}
 		}
@@ -1053,12 +1097,50 @@ func (aws *AWS) populatePricing(resp *http.Response, inputkeys map[string]bool) 
 					spotKey := key + ",preemptible"
 					if ok {
 						aws.Pricing[key].OnDemand = offerTerm
-						aws.Pricing[spotKey].OnDemand = offerTerm
+						if _, ok := aws.Pricing[spotKey]; ok {
+							aws.Pricing[spotKey].OnDemand = offerTerm
+						}
 						var cost string
 						if _, isMatch := OnDemandRateCodes[offerTerm.OfferTermCode]; isMatch {
-							cost = offerTerm.PriceDimensions[strings.Join([]string{sku.(string), offerTerm.OfferTermCode, HourlyRateCode}, ".")].PricePerUnit.USD
+							priceDimensionKey := strings.Join([]string{sku.(string), offerTerm.OfferTermCode, HourlyRateCode}, ".")
+							dimension, ok := offerTerm.PriceDimensions[priceDimensionKey]
+							if ok {
+								cost = dimension.PricePerUnit.USD
+							} else {
+								// this is an edge case seen in AWS CN pricing files, including here just in case
+								// if there is only one dimension, use it, even if the key is incorrect, otherwise assume defaults
+								if len(offerTerm.PriceDimensions) == 1 {
+									for key, backupDimension := range offerTerm.PriceDimensions {
+										cost = backupDimension.PricePerUnit.USD
+										log.DedupedWarningf(5, "using:%s for a price dimension instead of missing dimension: %s", offerTerm.PriceDimensions[key], priceDimensionKey)
+										break
+									}
+								} else if len(offerTerm.PriceDimensions) == 0 {
+									log.DedupedWarningf(5, "populatePricing: no pricing dimension available for: %s.", priceDimensionKey)
+								} else {
+									log.DedupedWarningf(5, "populatePricing: no assumable pricing dimension available for: %s.", priceDimensionKey)
+								}
+							}
 						} else if _, isMatch := OnDemandRateCodesCn[offerTerm.OfferTermCode]; isMatch {
-							cost = offerTerm.PriceDimensions[strings.Join([]string{sku.(string), offerTerm.OfferTermCode, HourlyRateCodeCn}, ".")].PricePerUnit.CNY
+							priceDimensionKey := strings.Join([]string{sku.(string), offerTerm.OfferTermCode, HourlyRateCodeCn}, ".")
+							dimension, ok := offerTerm.PriceDimensions[priceDimensionKey]
+							if ok {
+								cost = dimension.PricePerUnit.CNY
+							} else {
+								// fall through logic for handling inconsistencies in AWS CN pricing files
+								// if there is only one dimension, use it, even if the key is incorrect, otherwise assume defaults
+								if len(offerTerm.PriceDimensions) == 1 {
+									for key, backupDimension := range offerTerm.PriceDimensions {
+										cost = backupDimension.PricePerUnit.CNY
+										log.DedupedWarningf(5, "using:%s for a price dimension instead of missing dimension: %s", offerTerm.PriceDimensions[key], priceDimensionKey)
+										break
+									}
+								} else if len(offerTerm.PriceDimensions) == 0 {
+									log.DedupedWarningf(5, "populatePricing: no pricing dimension available for: %s.", priceDimensionKey)
+								} else {
+									log.DedupedWarningf(5, "populatePricing: no assumable pricing dimension available for: %s.", priceDimensionKey)
+								}
+							}
 						}
 						if strings.Contains(key, "EBS:VolumeP-IOPS.piops") {
 							// If the specific UsageType is the per IO cost used on io1 volumes
@@ -1072,6 +1154,13 @@ func (aws *AWS) populatePricing(resp *http.Response, inputkeys map[string]bool) 
 							hourlyPrice := costFloat / 730
 
 							aws.Pricing[key].PV.Cost = strconv.FormatFloat(hourlyPrice, 'f', -1, 64)
+						} else if strings.Contains(key, "LoadBalancerUsage") {
+							costFloat, err := strconv.ParseFloat(cost, 64)
+							if err != nil {
+								return err
+							}
+
+							aws.Pricing[key].LoadBalancer.Cost = costFloat
 						}
 					}
 
@@ -1142,21 +1231,20 @@ func (aws *AWS) NetworkPricing() (*models.Network, error) {
 }
 
 func (aws *AWS) LoadBalancerPricing() (*models.LoadBalancer, error) {
-	fffrc := 0.025
-	afrc := 0.010
-	lbidc := 0.008
+	// TODO: determine key based on function arguments
+	// this is something that should be changed in the Provider interface
 
-	numForwardingRules := 1.0
-	dataIngressGB := 0.0
+	key := aws.ClusterRegion + ",LoadBalancerUsage"
 
-	var totalCost float64
-	if numForwardingRules < 5 {
-		totalCost = fffrc*numForwardingRules + lbidc*dataIngressGB
-	} else {
-		totalCost = fffrc*5 + afrc*(numForwardingRules-5) + lbidc*dataIngressGB
+	// set default price
+	hourlyCost := 0.025
+	// use price index when available
+	if terms, ok := aws.Pricing[key]; ok {
+		hourlyCost = terms.LoadBalancer.Cost
 	}
+
 	return &models.LoadBalancer{
-		Cost: totalCost,
+		Cost: hourlyCost,
 	}, nil
 }
 
@@ -1191,8 +1279,24 @@ func (aws *AWS) savingsPlanPricing(instanceID string) (*SavingsPlanData, bool) {
 	return data, ok
 }
 
-func (aws *AWS) createNode(terms *AWSProductTerms, usageType string, k models.Key) (*models.Node, error) {
+func (aws *AWS) createNode(terms *AWSProductTerms, usageType string, k models.Key) (*models.Node, models.PricingMetadata, error) {
 	key := k.Features()
+
+	meta := models.PricingMetadata{}
+	var cost string
+	publicPricingFound := true
+	c, ok := terms.OnDemand.PriceDimensions[strings.Join([]string{terms.Sku, terms.OnDemand.OfferTermCode, HourlyRateCode}, ".")]
+	if ok {
+		cost = c.PricePerUnit.USD
+	} else {
+		// Check for Chinese pricing
+		c, ok = terms.OnDemand.PriceDimensions[strings.Join([]string{terms.Sku, terms.OnDemand.OfferTermCode, HourlyRateCodeCn}, ".")]
+		if ok {
+			cost = c.PricePerUnit.CNY
+		} else {
+			publicPricingFound = false
+		}
+	}
 
 	if spotInfo, ok := aws.spotPricing(k.ID()); ok {
 		var spotcost string
@@ -1213,20 +1317,38 @@ func (aws *AWS) createNode(terms *AWSProductTerms, usageType string, k models.Ke
 			BaseRAMPrice: aws.BaseRAMPrice,
 			BaseGPUPrice: aws.BaseGPUPrice,
 			UsageType:    PreemptibleType,
-		}, nil
+		}, meta, nil
 	} else if aws.isPreemptible(key) { // Preemptible but we don't have any data in the pricing report.
 		log.DedupedWarningf(5, "Node %s marked preemptible but we have no data in spot feed", k.ID())
-		return &models.Node{
-			VCPU:         terms.VCpu,
-			VCPUCost:     aws.BaseSpotCPUPrice,
-			RAM:          terms.Memory,
-			GPU:          terms.GPU,
-			Storage:      terms.Storage,
-			BaseCPUPrice: aws.BaseCPUPrice,
-			BaseRAMPrice: aws.BaseRAMPrice,
-			BaseGPUPrice: aws.BaseGPUPrice,
-			UsageType:    PreemptibleType,
-		}, nil
+		if publicPricingFound {
+			// return public price if found
+			return &models.Node{
+				Cost:         cost,
+				VCPU:         terms.VCpu,
+				RAM:          terms.Memory,
+				GPU:          terms.GPU,
+				Storage:      terms.Storage,
+				BaseCPUPrice: aws.BaseCPUPrice,
+				BaseRAMPrice: aws.BaseRAMPrice,
+				BaseGPUPrice: aws.BaseGPUPrice,
+				UsageType:    PreemptibleType,
+			}, meta, nil
+		} else {
+			// return defaults if public pricing not found
+			log.DedupedWarningf(5, "Could not find Node %s's public pricing info, using default configured spot prices instead", k.ID())
+			return &models.Node{
+				VCPU:         terms.VCpu,
+				VCPUCost:     aws.BaseSpotCPUPrice,
+				RAMCost:      aws.BaseSpotRAMPrice,
+				RAM:          terms.Memory,
+				GPU:          terms.GPU,
+				Storage:      terms.Storage,
+				BaseCPUPrice: aws.BaseCPUPrice,
+				BaseRAMPrice: aws.BaseRAMPrice,
+				BaseGPUPrice: aws.BaseGPUPrice,
+				UsageType:    PreemptibleType,
+			}, meta, nil
+		}
 	} else if sp, ok := aws.savingsPlanPricing(k.ID()); ok {
 		strCost := fmt.Sprintf("%f", sp.EffectiveCost)
 		return &models.Node{
@@ -1239,7 +1361,7 @@ func (aws *AWS) createNode(terms *AWSProductTerms, usageType string, k models.Ke
 			BaseRAMPrice: aws.BaseRAMPrice,
 			BaseGPUPrice: aws.BaseGPUPrice,
 			UsageType:    usageType,
-		}, nil
+		}, meta, nil
 
 	} else if ri, ok := aws.reservedInstancePricing(k.ID()); ok {
 		strCost := fmt.Sprintf("%f", ri.EffectiveCost)
@@ -1253,21 +1375,12 @@ func (aws *AWS) createNode(terms *AWSProductTerms, usageType string, k models.Ke
 			BaseRAMPrice: aws.BaseRAMPrice,
 			BaseGPUPrice: aws.BaseGPUPrice,
 			UsageType:    usageType,
-		}, nil
+		}, meta, nil
 
 	}
-	var cost string
-	c, ok := terms.OnDemand.PriceDimensions[strings.Join([]string{terms.Sku, terms.OnDemand.OfferTermCode, HourlyRateCode}, ".")]
-	if ok {
-		cost = c.PricePerUnit.USD
-	} else {
-		// Check for Chinese pricing before throwing error
-		c, ok = terms.OnDemand.PriceDimensions[strings.Join([]string{terms.Sku, terms.OnDemand.OfferTermCode, HourlyRateCodeCn}, ".")]
-		if ok {
-			cost = c.PricePerUnit.CNY
-		} else {
-			return nil, fmt.Errorf("Could not fetch data for \"%s\"", k.ID())
-		}
+	// Throw error if public price is not found
+	if !publicPricingFound {
+		return nil, meta, fmt.Errorf("for node \"%s\", cannot find the following key in OnDemand pricing data \"%s\"", k.ID(), k.Features())
 	}
 
 	return &models.Node{
@@ -1280,11 +1393,11 @@ func (aws *AWS) createNode(terms *AWSProductTerms, usageType string, k models.Ke
 		BaseRAMPrice: aws.BaseRAMPrice,
 		BaseGPUPrice: aws.BaseGPUPrice,
 		UsageType:    usageType,
-	}, nil
+	}, meta, nil
 }
 
 // NodePricing takes in a key from GetKey and returns a Node object for use in building the cost model.
-func (aws *AWS) NodePricing(k models.Key) (*models.Node, error) {
+func (aws *AWS) NodePricing(k models.Key) (*models.Node, models.PricingMetadata, error) {
 	aws.DownloadPricingDataLock.RLock()
 	defer aws.DownloadPricingDataLock.RUnlock()
 
@@ -1294,7 +1407,12 @@ func (aws *AWS) NodePricing(k models.Key) (*models.Node, error) {
 		usageType = PreemptibleType
 	}
 
+	meta := models.PricingMetadata{}
+
 	terms, ok := aws.Pricing[key]
+	if termsStr, err := json.Marshal(terms); err == nil {
+		log.Debugf("NodePricing: for key \"%s\" found the following OnDemand data: %s", key, string(termsStr))
+	}
 	if ok {
 		return aws.createNode(terms, usageType, k)
 	} else if _, ok := aws.ValidPricingKeys[key]; ok {
@@ -1309,7 +1427,7 @@ func (aws *AWS) NodePricing(k models.Key) (*models.Node, error) {
 				BaseGPUPrice:     aws.BaseGPUPrice,
 				UsageType:        usageType,
 				UsesBaseCPUPrice: true,
-			}, err
+			}, meta, err
 		}
 		terms, termsOk := aws.Pricing[key]
 		if !termsOk {
@@ -1320,11 +1438,11 @@ func (aws *AWS) NodePricing(k models.Key) (*models.Node, error) {
 				BaseGPUPrice:     aws.BaseGPUPrice,
 				UsageType:        usageType,
 				UsesBaseCPUPrice: true,
-			}, fmt.Errorf("Unable to find any Pricing data for \"%s\"", key)
+			}, meta, fmt.Errorf("Unable to find any Pricing data for \"%s\"", key)
 		}
 		return aws.createNode(terms, usageType, k)
 	} else { // Fall back to base pricing if we can't find the key. Base pricing is handled at the costmodel level.
-		return nil, fmt.Errorf("Invalid Pricing Key \"%s\"", key)
+		return nil, meta, fmt.Errorf("Invalid Pricing Key \"%s\"", key)
 
 	}
 }
@@ -1341,19 +1459,18 @@ func (awsProvider *AWS) ClusterInfo() (map[string]string, error) {
 	// Determine cluster name
 	clusterName := c.ClusterName
 	if clusterName == "" {
-		awsClusterID := env.GetAWSClusterID()
+		awsClusterID := ocenv.GetAWSClusterID()
 		if awsClusterID != "" {
 			log.Infof("Returning \"%s\" as ClusterName", awsClusterID)
 			clusterName = awsClusterID
-			log.Warnf("Warning - %s will be deprecated in a future release. Use %s instead", env.AWSClusterIDEnvVar, env.ClusterIDEnvVar)
-		} else if clusterName = env.GetClusterID(); clusterName != "" {
-			log.Infof("Setting cluster name to %s from %s ", clusterName, env.ClusterIDEnvVar)
+			log.Warnf("Warning - %s will be deprecated in a future release. Use %s instead", ocenv.AWSClusterIDEnvVar, ocenv.ClusterIDEnvVar)
+		} else if clusterName = ocenv.GetClusterID(); clusterName != "" {
+			log.DedupedInfof(5, "Setting cluster name to %s from %s ", clusterName, ocenv.ClusterIDEnvVar)
 		} else {
 			clusterName = defaultClusterName
-			log.Warnf("Unable to detect cluster name - using default of %s", defaultClusterName)
-			log.Warnf("Please set cluster name through configmap or via %s env var", env.ClusterIDEnvVar)
+			log.DedupedWarningf(5, "Unable to detect cluster name - using default of %s", defaultClusterName)
+			log.DedupedWarningf(5, "Please set cluster name through configmap or via %s env var", ocenv.ClusterIDEnvVar)
 		}
-
 	}
 
 	// this value requires configuration but is unavailable else where
@@ -1365,11 +1482,11 @@ func (awsProvider *AWS) ClusterInfo() (map[string]string, error) {
 
 	m := make(map[string]string)
 	m["name"] = clusterName
-	m["provider"] = kubecost.AWSProvider
+	m["provider"] = opencost.AWSProvider
 	m["account"] = clusterAccountID
 	m["region"] = awsProvider.ClusterRegion
-	m["id"] = env.GetClusterID()
-	m["remoteReadEnabled"] = strconv.FormatBool(env.IsRemoteEnabled())
+	m["id"] = ocenv.GetClusterID()
+	m["remoteReadEnabled"] = strconv.FormatBool(ocenv.IsRemoteEnabled())
 	m["provisioner"] = awsProvider.clusterProvisioner
 	return m, nil
 }
@@ -1387,11 +1504,11 @@ func (aws *AWS) ConfigureAuth() error {
 func (aws *AWS) ConfigureAuthWith(config *models.CustomPricing) error {
 	accessKeyID, accessKeySecret := aws.getAWSAuth(false, config)
 	if accessKeyID != "" && accessKeySecret != "" { // credentials may exist on the actual AWS node-- if so, use those. If not, override with the service key
-		err := env.Set(env.AWSAccessKeyIDEnvVar, accessKeyID)
+		err := env.Set(ocenv.AWSAccessKeyIDEnvVar, accessKeyID)
 		if err != nil {
 			return err
 		}
-		err = env.Set(env.AWSAccessKeySecretEnvVar, accessKeySecret)
+		err = env.Set(ocenv.AWSAccessKeySecretEnvVar, accessKeySecret)
 		if err != nil {
 			return err
 		}
@@ -1401,7 +1518,6 @@ func (aws *AWS) ConfigureAuthWith(config *models.CustomPricing) error {
 
 // Gets the aws key id and secret
 func (aws *AWS) getAWSAuth(forceReload bool, cp *models.CustomPricing) (string, string) {
-
 	// 1. Check config values first (set from frontend UI)
 	if cp.ServiceKeyName != "" && cp.ServiceKeySecret != "" {
 		aws.ServiceAccountChecks.Set("hasKey", &models.ServiceAccountCheck{
@@ -1422,7 +1538,7 @@ func (aws *AWS) getAWSAuth(forceReload bool, cp *models.CustomPricing) (string, 
 	}
 
 	// 3. Fall back to env vars
-	if env.GetAWSAccessKeyID() == "" || env.GetAWSAccessKeySecret() == "" {
+	if ocenv.GetAWSAccessKeyID() == "" || ocenv.GetAWSAccessKeySecret() == "" {
 		aws.ServiceAccountChecks.Set("hasKey", &models.ServiceAccountCheck{
 			Message: "AWS ServiceKey exists",
 			Status:  false,
@@ -1433,7 +1549,7 @@ func (aws *AWS) getAWSAuth(forceReload bool, cp *models.CustomPricing) (string, 
 			Status:  true,
 		})
 	}
-	return env.GetAWSAccessKeyID(), env.GetAWSAccessKeySecret()
+	return ocenv.GetAWSAccessKeyID(), ocenv.GetAWSAccessKeySecret()
 }
 
 // Load once and cache the result (even on failure). This is an install time secret, so
@@ -1459,6 +1575,12 @@ func (aws *AWS) loadAWSAuthSecret(force bool) (*AWSAccessKey, error) {
 	err = json.Unmarshal(result, &ak)
 	if err != nil {
 		return nil, err
+	}
+
+	// If the sample nil service key name is set, zero it out so that it is not
+	// misinterpreted as a real service key.
+	if ak.AccessKeyID == "AKIXXX" {
+		ak.AccessKeyID = ""
 	}
 
 	awsSecret = &ak
@@ -1492,20 +1614,33 @@ func (aws *AWS) getAllAddresses() ([]*ec2Types.Address, error) {
 
 	// Get volumes from each AWS region
 	for _, r := range regions {
+		region := r // make a copy of r to avoid capturing loop variable
 		// Fetch IP address response and send results and errors to their
 		// respective channels
-		go func(region string) {
+		go func() {
 			defer wg.Done()
 			defer errs.HandlePanic()
 
 			// Query for first page of volume results
 			resp, err := aws.getAddressesForRegion(context.TODO(), region)
 			if err != nil {
-				errorCh <- err
-				return
+				var awsErr smithy.APIError
+				if errors.As(err, &awsErr) {
+					switch awsErr.ErrorCode() {
+					case "AuthFailure", "InvalidClientTokenId", "UnauthorizedOperation":
+						log.DedupedInfof(5, "Unable to get addresses for region %s due to AWS permissions, error message: %s", region, awsErr.ErrorMessage())
+						return
+					default:
+						errorCh <- err
+						return
+					}
+				} else {
+					errorCh <- err
+					return
+				}
 			}
 			addressCh <- resp
-		}(r)
+		}()
 	}
 
 	// Close the result channels after everything has been sent
@@ -1603,8 +1738,20 @@ func (aws *AWS) getAllDisks() ([]*ec2Types.Volume, error) {
 			// Query for first page of volume results
 			resp, err := aws.getDisksForRegion(context.TODO(), region, 1000, nil)
 			if err != nil {
-				errorCh <- err
-				return
+				var awsErr smithy.APIError
+				if errors.As(err, &awsErr) {
+					switch awsErr.ErrorCode() {
+					case "AuthFailure", "InvalidClientTokenId", "UnauthorizedOperation":
+						log.DedupedInfof(5, "Unable to get disks for region %s due to AWS permissions, error message: %s", region, awsErr.ErrorMessage())
+						return
+					default:
+						errorCh <- err
+						return
+					}
+				} else {
+					errorCh <- err
+					return
+				}
 			}
 			volumeCh <- resp
 
@@ -1686,14 +1833,17 @@ func (aws *AWS) isDiskOrphaned(vol *ec2Types.Volume) bool {
 }
 
 func (aws *AWS) GetOrphanedResources() ([]models.OrphanedResource, error) {
-	volumes, err := aws.getAllDisks()
-	if err != nil {
-		return nil, err
-	}
+	volumes, volumesErr := aws.getAllDisks()
+	addresses, addressesErr := aws.getAllAddresses()
 
-	addresses, err := aws.getAllAddresses()
-	if err != nil {
-		return nil, err
+	// If we have any orphaned resources - prioritize returning them over returning errors
+	if len(addresses) == 0 && len(volumes) == 0 {
+		if volumesErr != nil {
+			return nil, volumesErr
+		}
+		if addressesErr != nil {
+			return nil, addressesErr
+		}
 	}
 
 	var orphanedResources []models.OrphanedResource
@@ -1723,6 +1873,12 @@ func (aws *AWS) GetOrphanedResources() ([]models.OrphanedResource, error) {
 				url = "https://console.aws.amazon.com/ec2/home?#Volumes:sort=desc:createTime"
 			}
 
+			// output tags as desc
+			tags := map[string]string{}
+			for _, tag := range volume.Tags {
+				tags[*tag.Key] = *tag.Value
+			}
+
 			or := models.OrphanedResource{
 				Kind:        "disk",
 				Region:      zone,
@@ -1730,6 +1886,7 @@ func (aws *AWS) GetOrphanedResources() ([]models.OrphanedResource, error) {
 				DiskName:    *volume.VolumeId,
 				Url:         url,
 				MonthlyCost: cost,
+				Description: tags,
 			}
 
 			orphanedResources = append(orphanedResources, or)
@@ -1777,7 +1934,7 @@ func (aws *AWS) findCostForDisk(disk *ec2Types.Volume) (*float64, error) {
 
 	class := volTypes[string(disk.VolumeType)]
 
-	key := "us-east-2" + "," + class
+	key := aws.ClusterRegion + "," + class
 
 	pricing, ok := aws.Pricing[key]
 	if !ok {
@@ -1813,6 +1970,10 @@ func (aws *AWS) QueryAthenaPaginated(ctx context.Context, query string, fn func(
 
 	queryExecutionCtx := &athenaTypes.QueryExecutionContext{
 		Database: awsSDK.String(awsAthenaInfo.AthenaDatabase),
+	}
+
+	if awsAthenaInfo.AthenaCatalog != "" {
+		queryExecutionCtx.Catalog = awsSDK.String(awsAthenaInfo.AthenaCatalog)
 	}
 
 	resultConfiguration := &athenaTypes.ResultConfiguration{
@@ -2288,7 +2449,7 @@ func (aws *AWS) CombinedDiscountForNode(instanceType string, isPreemptible bool,
 // Regions returns a predefined list of AWS regions
 func (aws *AWS) Regions() []string {
 
-	regionOverrides := env.GetRegionOverrideList()
+	regionOverrides := ocenv.GetRegionOverrideList()
 
 	if len(regionOverrides) > 0 {
 		log.Debugf("Overriding AWS regions with configured region list: %+v", regionOverrides)

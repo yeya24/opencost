@@ -7,8 +7,9 @@ import (
 	"github.com/opencost/opencost/pkg/cloud/models"
 	"github.com/opencost/opencost/pkg/cloud/provider"
 
+	"github.com/opencost/opencost/core/pkg/log"
+	"github.com/opencost/opencost/core/pkg/opencost"
 	"github.com/opencost/opencost/pkg/env"
-	"github.com/opencost/opencost/pkg/log"
 	"github.com/opencost/opencost/pkg/prom"
 )
 
@@ -190,12 +191,6 @@ func buildGPUCostMap(
 	gpuCostMap := make(map[NodeIdentifier]float64)
 	clusterAndNameToType := make(map[nodeIdentifierNoProviderID]string)
 
-	customPricingEnabled := provider.CustomPricesEnabled(cp)
-	customPricingConfig, err := cp.GetConfig()
-	if err != nil {
-		log.Warnf("ClusterNodes: failed to load custom pricing: %s", err)
-	}
-
 	for _, result := range resNodeGPUCost {
 		cluster, err := result.GetString(env.GetPromClusterLabel())
 		if err != nil {
@@ -221,33 +216,11 @@ func buildGPUCostMap(
 			Name:    name,
 		}
 
-		var gpuCost float64
-
-		if customPricingEnabled && customPricingConfig != nil {
-
-			var customGPUStr string
-			if spot, ok := preemptible[key]; ok && spot {
-				customGPUStr = customPricingConfig.SpotGPU
-			} else {
-				customGPUStr = customPricingConfig.GPU
-			}
-
-			customGPUCost, err := strconv.ParseFloat(customGPUStr, 64)
-			if err != nil {
-				log.Warnf("ClusterNodes: error parsing custom GPU price: %s", customGPUStr)
-			}
-			gpuCost = customGPUCost
-
-		} else {
-
-			gpuCost = result.Values[0].Value
-
-		}
-
 		clusterAndNameToType[keyNon] = nodeType
 
 		// If gpu count is available use it to multiply gpu cost
 		if value, ok := gpuCountMap[key]; ok {
+			gpuCost := result.Values[0].Value
 			gpuCostMap[key] = gpuCost * value
 		} else {
 			gpuCostMap[key] = 0
@@ -527,7 +500,7 @@ type activeData struct {
 	minutes float64
 }
 
-func buildActiveDataMap(resActiveMins []*prom.QueryResult, resolution time.Duration) map[NodeIdentifier]activeData {
+func buildActiveDataMap(resActiveMins []*prom.QueryResult, resolution time.Duration, window opencost.Window) map[NodeIdentifier]activeData {
 
 	m := make(map[NodeIdentifier]activeData)
 
@@ -555,8 +528,7 @@ func buildActiveDataMap(resActiveMins []*prom.QueryResult, resolution time.Durat
 			continue
 		}
 
-		s := time.Unix(int64(result.Values[0].Timestamp), 0)
-		e := time.Unix(int64(result.Values[len(result.Values)-1].Timestamp), 0)
+		s, e := calculateStartAndEnd(result, resolution, window)
 		mins := e.Sub(s).Minutes()
 
 		// TODO niko/assets if mins >= threshold, interpolate for missing data?
@@ -636,12 +608,15 @@ func buildLabelsMap(
 			Name:    node,
 		}
 
-		m[key] = make(map[string]string)
-
-		for name, value := range result.Metric {
-			if val, ok := value.(string); ok {
-				m[key][name] = val
-			}
+		// The QueryResult.GetLabels function needs to be called to sanitize the
+		// ingested label data. This removes the label_ prefix that prometheus
+		// adds to emitted labels. It also keeps from ingesting prometheus labels
+		// that aren't a part of the asset.
+		if _, ok := m[key]; !ok {
+			m[key] = map[string]string{}
+		}
+		for k, l := range result.GetLabels() {
+			m[key][k] = l
 		}
 	}
 	return m

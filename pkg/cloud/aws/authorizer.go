@@ -8,17 +8,18 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
-	"github.com/opencost/opencost/pkg/cloud/config"
-	"github.com/opencost/opencost/pkg/util/json"
+	"github.com/opencost/opencost/core/pkg/util/json"
+	"github.com/opencost/opencost/pkg/cloud"
 )
 
 const AccessKeyAuthorizerType = "AWSAccessKey"
 const ServiceAccountAuthorizerType = "AWSServiceAccount"
 const AssumeRoleAuthorizerType = "AWSAssumeRole"
+const WebIdentityAuthorizerType = "AWSWebIdentity"
 
 // Authorizer implementations provide aws.Config for AWS SDK calls
 type Authorizer interface {
-	config.Authorizer
+	cloud.Authorizer
 	CreateAWSConfig(string) (aws.Config, error)
 }
 
@@ -31,6 +32,8 @@ func SelectAuthorizerByType(typeStr string) (Authorizer, error) {
 		return &ServiceAccount{}, nil
 	case AssumeRoleAuthorizerType:
 		return &AssumeRole{}, nil
+	case WebIdentityAuthorizerType:
+		return &WebIdentity{}, nil
 	default:
 		return nil, fmt.Errorf("AWS: provider authorizer type '%s' is not valid", typeStr)
 	}
@@ -45,7 +48,7 @@ type AccessKey struct {
 // MarshalJSON custom json marshalling functions, sets properties as tagged in struct and sets the authorizer type property
 func (ak *AccessKey) MarshalJSON() ([]byte, error) {
 	fmap := make(map[string]any, 3)
-	fmap[config.AuthorizerTypeProperty] = AccessKeyAuthorizerType
+	fmap[cloud.AuthorizerTypeProperty] = AccessKeyAuthorizerType
 	fmap["id"] = ak.ID
 	fmap["secret"] = ak.Secret
 	return json.Marshal(fmap)
@@ -70,7 +73,7 @@ func (ak *AccessKey) Validate() error {
 	return nil
 }
 
-func (ak *AccessKey) Equals(config config.Config) bool {
+func (ak *AccessKey) Equals(config cloud.Config) bool {
 	if config == nil {
 		return false
 	}
@@ -88,10 +91,10 @@ func (ak *AccessKey) Equals(config config.Config) bool {
 	return true
 }
 
-func (ak *AccessKey) Sanitize() config.Config {
+func (ak *AccessKey) Sanitize() cloud.Config {
 	return &AccessKey{
 		ID:     ak.ID,
-		Secret: config.Redacted,
+		Secret: cloud.Redacted,
 	}
 }
 
@@ -115,7 +118,7 @@ type ServiceAccount struct{}
 // MarshalJSON custom json marshalling functions, sets properties as tagged in struct and sets the authorizer type property
 func (sa *ServiceAccount) MarshalJSON() ([]byte, error) {
 	fmap := make(map[string]any, 1)
-	fmap[config.AuthorizerTypeProperty] = ServiceAccountAuthorizerType
+	fmap[cloud.AuthorizerTypeProperty] = ServiceAccountAuthorizerType
 	return json.Marshal(fmap)
 }
 
@@ -124,19 +127,15 @@ func (sa *ServiceAccount) Validate() error {
 	return nil
 }
 
-func (sa *ServiceAccount) Equals(config config.Config) bool {
+func (sa *ServiceAccount) Equals(config cloud.Config) bool {
 	if config == nil {
 		return false
 	}
 	_, ok := config.(*ServiceAccount)
-	if !ok {
-		return false
-	}
-
-	return true
+	return ok
 }
 
-func (sa *ServiceAccount) Sanitize() config.Config {
+func (sa *ServiceAccount) Sanitize() cloud.Config {
 	return &ServiceAccount{}
 }
 
@@ -157,7 +156,7 @@ type AssumeRole struct {
 // MarshalJSON custom json marshalling functions, sets properties as tagged in struct and sets the authorizer type property
 func (ara *AssumeRole) MarshalJSON() ([]byte, error) {
 	fmap := make(map[string]any, 3)
-	fmap[config.AuthorizerTypeProperty] = AssumeRoleAuthorizerType
+	fmap[cloud.AuthorizerTypeProperty] = AssumeRoleAuthorizerType
 	fmap["roleARN"] = ara.RoleARN
 	fmap["authorizer"] = ara.Authorizer
 	return json.Marshal(fmap)
@@ -173,7 +172,7 @@ func (ara *AssumeRole) UnmarshalJSON(b []byte) error {
 
 	fmap := f.(map[string]interface{})
 
-	roleARN, err := config.GetInterfaceValue[string](fmap, "roleARN")
+	roleARN, err := cloud.GetInterfaceValue[string](fmap, "roleARN")
 	if err != nil {
 		return fmt.Errorf("StorageConfiguration: UnmarshalJSON: %s", err.Error())
 	}
@@ -183,7 +182,7 @@ func (ara *AssumeRole) UnmarshalJSON(b []byte) error {
 	if !ok {
 		return fmt.Errorf("AssumeRole: UnmarshalJSON: missing Authorizer")
 	}
-	authorizer, err := config.AuthorizerFromInterface(authAny, SelectAuthorizerByType)
+	authorizer, err := cloud.AuthorizerFromInterface(authAny, SelectAuthorizerByType)
 	if err != nil {
 		return fmt.Errorf("AssumeRole: UnmarshalJSON: %s", err.Error())
 	}
@@ -204,7 +203,7 @@ func (ara *AssumeRole) CreateAWSConfig(region string) (aws.Config, error) {
 
 func (ara *AssumeRole) Validate() error {
 	if ara.Authorizer == nil {
-		return fmt.Errorf("AssumeRole: misisng base Authorizer")
+		return fmt.Errorf("AssumeRole: missing base Authorizer")
 	}
 	err := ara.Authorizer.Validate()
 	if err != nil {
@@ -212,13 +211,13 @@ func (ara *AssumeRole) Validate() error {
 	}
 
 	if ara.RoleARN == "" {
-		return fmt.Errorf("AssumeRole: misisng RoleARN configuration")
+		return fmt.Errorf("AssumeRole: missing RoleARN configuration")
 	}
 
 	return nil
 }
 
-func (ara *AssumeRole) Equals(config config.Config) bool {
+func (ara *AssumeRole) Equals(config cloud.Config) bool {
 	if config == nil {
 		return false
 	}
@@ -243,9 +242,119 @@ func (ara *AssumeRole) Equals(config config.Config) bool {
 	return true
 }
 
-func (ara *AssumeRole) Sanitize() config.Config {
+func (ara *AssumeRole) Sanitize() cloud.Config {
 	return &AssumeRole{
 		Authorizer: ara.Authorizer.Sanitize().(Authorizer),
 		RoleARN:    ara.RoleARN,
+	}
+}
+
+type WebIdentity struct {
+	RoleARN          string           `json:"roleARN"`
+	IdentityProvider string           `json:"identityProvider"`
+	TokenRetriever   IDTokenRetriever `json:"tokenRetriever"`
+}
+
+func (wea *WebIdentity) CreateAWSConfig(region string) (aws.Config, error) {
+	cfg, err := awsconfig.LoadDefaultConfig(context.TODO(), awsconfig.WithRegion(region))
+	if err != nil {
+		return cfg, fmt.Errorf("failed to initialize AWS SDK config for region from annotation %s: %s", region, err)
+	}
+
+	stsSvc := sts.NewFromConfig(cfg)
+	creds := stscreds.NewWebIdentityRoleProvider(stsSvc, wea.RoleARN, wea.TokenRetriever)
+
+	cfg.Credentials = aws.NewCredentialsCache(creds)
+	return cfg, nil
+}
+
+func (wea *WebIdentity) MarshalJSON() ([]byte, error) {
+	fmap := make(map[string]any, 4)
+	fmap[cloud.AuthorizerTypeProperty] = WebIdentityAuthorizerType
+	fmap["roleARN"] = wea.RoleARN
+	fmap["identityProvider"] = wea.IdentityProvider
+	fmap["tokenRetriever"] = wea.TokenRetriever
+	return json.Marshal(fmap)
+}
+
+func (wea *WebIdentity) UnmarshalJSON(b []byte) error {
+	var f interface{}
+	err := json.Unmarshal(b, &f)
+	if err != nil {
+		return err
+	}
+
+	fmap := f.(map[string]interface{})
+
+	roleARN, err := cloud.GetInterfaceValue[string](fmap, "roleARN")
+	if err != nil {
+		return fmt.Errorf("WebIdentity: UnmarshalJSON: %s", err.Error())
+	}
+	wea.RoleARN = roleARN
+
+	idp, err := cloud.GetInterfaceValue[string](fmap, "identityProvider")
+	if err != nil {
+		return fmt.Errorf("WebIdentity: UnmarshalJSON: %s", err.Error())
+	}
+	wea.IdentityProvider = idp
+
+	var tr interface{}
+
+	tr, err = cloud.GetInterfaceValue[interface{}](fmap, "tokenRetriever")
+	if err != nil {
+		return fmt.Errorf("WebIdentity: UnmarshalJSON: %s", err.Error())
+	}
+
+	trb, err := json.Marshal(tr)
+	if err != nil {
+		return fmt.Errorf("WebIdentity: UnmarshalJSON: %s", err.Error())
+	}
+
+	var tokenRetriever IDTokenRetriever
+	switch idp {
+	case "Google":
+		tokenRetriever = &GoogleIDTokenRetriever{}
+	}
+
+	err = json.Unmarshal(trb, &tokenRetriever)
+	if err != nil {
+		return fmt.Errorf("WebIdentity: UnmarshalJSON: %s", err.Error())
+	}
+
+	wea.TokenRetriever = tokenRetriever
+
+	return nil
+}
+
+func (wea *WebIdentity) Validate() error {
+
+	if wea.RoleARN == "" {
+		return fmt.Errorf("WebIdentity: missing RoleARN configuration")
+	}
+
+	if wea.TokenRetriever == nil {
+		return fmt.Errorf("WebIdentity: missing TokenRetriever configuration")
+	}
+
+	return wea.TokenRetriever.Validate()
+}
+
+func (wea *WebIdentity) Equals(config cloud.Config) bool {
+	if config == nil {
+		return false
+	}
+	thatConfig, ok := config.(*WebIdentity)
+	if !ok {
+		return false
+	}
+
+	return wea.RoleARN == thatConfig.RoleARN && wea.IdentityProvider == thatConfig.IdentityProvider && wea.TokenRetriever.Equals(thatConfig.TokenRetriever)
+}
+
+func (wea *WebIdentity) Sanitize() cloud.Config {
+	return &WebIdentity{
+		RoleARN:          wea.RoleARN,
+		IdentityProvider: wea.IdentityProvider,
+		TokenRetriever:   wea.TokenRetriever.Sanitize(),
 	}
 }

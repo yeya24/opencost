@@ -2,19 +2,26 @@ package gcp
 
 import (
 	"context"
-	"regexp"
-	"strings"
+	"fmt"
 
 	"cloud.google.com/go/bigquery"
-	cloudconfig "github.com/opencost/opencost/pkg/cloud/config"
-	"github.com/opencost/opencost/pkg/kubecost"
+	"github.com/opencost/opencost/pkg/cloud"
 )
 
 type BigQueryQuerier struct {
 	BigQueryConfiguration
+	ConnectionStatus cloud.ConnectionStatus
 }
 
-func (bqq *BigQueryQuerier) Equals(config cloudconfig.Config) bool {
+func (bqq *BigQueryQuerier) GetStatus() cloud.ConnectionStatus {
+	// initialize status if it has not done so; this can happen if the integration is inactive
+	if bqq.ConnectionStatus.String() == "" {
+		bqq.ConnectionStatus = cloud.InitialStatus
+	}
+	return bqq.ConnectionStatus
+}
+
+func (bqq *BigQueryQuerier) Equals(config cloud.Config) bool {
 	thatConfig, ok := config.(*BigQueryQuerier)
 	if !ok {
 		return false
@@ -23,88 +30,32 @@ func (bqq *BigQueryQuerier) Equals(config cloudconfig.Config) bool {
 	return bqq.BigQueryConfiguration.Equals(&thatConfig.BigQueryConfiguration)
 }
 
-func (bqq *BigQueryQuerier) QueryBigQuery(ctx context.Context, queryStr string) (*bigquery.RowIterator, error) {
+func (bqq *BigQueryQuerier) Query(ctx context.Context, queryStr string) (*bigquery.RowIterator, error) {
+	err := bqq.Validate()
+
+	if err != nil {
+		bqq.ConnectionStatus = cloud.InvalidConfiguration
+		return nil, err
+	}
+
 	client, err := bqq.GetBigQueryClient(ctx)
 	if err != nil {
+		bqq.ConnectionStatus = cloud.FailedConnection
 		return nil, err
 	}
 
 	query := client.Query(queryStr)
-	return query.Read(ctx)
-}
+	iter, err := query.Read(ctx)
 
-func GCPSelectCategory(service, description string) string {
-	s := strings.ToLower(service)
-	d := strings.ToLower(description)
-
-	// Network descriptions
-	if strings.Contains(d, "download") {
-		return kubecost.NetworkCategory
-	}
-	if strings.Contains(d, "network") {
-		return kubecost.NetworkCategory
-	}
-	if strings.Contains(d, "ingress") {
-		return kubecost.NetworkCategory
-	}
-	if strings.Contains(d, "egress") {
-		return kubecost.NetworkCategory
-	}
-	if strings.Contains(d, "static ip") {
-		return kubecost.NetworkCategory
-	}
-	if strings.Contains(d, "external ip") {
-		return kubecost.NetworkCategory
-	}
-	if strings.Contains(d, "load balanced") {
-		return kubecost.NetworkCategory
-	}
-	if strings.Contains(d, "licensing fee") {
-		return kubecost.OtherCategory
+	// If result is empty and connection status is not already successful update status to missing data
+	if iter == nil && bqq.ConnectionStatus != cloud.SuccessfulConnection {
+		bqq.ConnectionStatus = cloud.MissingData
+	} else {
+		bqq.ConnectionStatus = cloud.SuccessfulConnection
 	}
 
-	// Storage Descriptions
-	if strings.Contains(d, "storage") {
-		return kubecost.StorageCategory
+	if err != nil {
+		return iter, fmt.Errorf("BigQueryQuerier: Query: error reading query results: %w", err)
 	}
-	if strings.Contains(d, "pd capacity") {
-		return kubecost.StorageCategory
-	}
-	if strings.Contains(d, "pd iops") {
-		return kubecost.StorageCategory
-	}
-	if strings.Contains(d, "pd snapshot") {
-		return kubecost.StorageCategory
-	}
-
-	// Service Defaults
-	if strings.Contains(s, "storage") {
-		return kubecost.StorageCategory
-	}
-	if strings.Contains(s, "compute") {
-		return kubecost.ComputeCategory
-	}
-	if strings.Contains(s, "sql") {
-		return kubecost.StorageCategory
-	}
-	if strings.Contains(s, "bigquery") {
-		return kubecost.StorageCategory
-	}
-	if strings.Contains(s, "kubernetes") {
-		return kubecost.ManagementCategory
-	} else if strings.Contains(s, "pub/sub") {
-		return kubecost.NetworkCategory
-	}
-
-	return kubecost.OtherCategory
-}
-
-var parseProviderIDRx = regexp.MustCompile("^.+\\/(.+)?") // Capture "gke-cluster-3-default-pool-xxxx-yy" from "projects/###/instances/gke-cluster-3-default-pool-xxxx-yy"
-
-func GCPParseProviderID(id string) string {
-	match := parseProviderIDRx.FindStringSubmatch(id)
-	if len(match) == 0 {
-		return id
-	}
-	return match[len(match)-1]
+	return iter, nil
 }

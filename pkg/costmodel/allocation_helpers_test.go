@@ -2,11 +2,12 @@ package costmodel
 
 import (
 	"fmt"
-	"github.com/opencost/opencost/pkg/kubecost"
-	"github.com/opencost/opencost/pkg/prom"
-	"github.com/opencost/opencost/pkg/util"
 	"testing"
 	"time"
+
+	"github.com/opencost/opencost/core/pkg/opencost"
+	"github.com/opencost/opencost/core/pkg/util"
+	"github.com/opencost/opencost/pkg/prom"
 )
 
 const Ki = 1024
@@ -18,7 +19,7 @@ const hour = minute * 60.0
 
 var windowStart = time.Date(2020, 6, 16, 0, 0, 0, 0, time.UTC)
 var windowEnd = time.Date(2020, 6, 17, 0, 0, 0, 0, time.UTC)
-var window = kubecost.NewWindow(&windowStart, &windowEnd)
+var window = opencost.NewWindow(&windowStart, &windowEnd)
 
 var startFloat = float64(windowStart.Unix())
 
@@ -55,27 +56,27 @@ var podKey4 = podKey{
 var podKeyUnmounted = podKey{
 	namespaceKey: namespaceKey{
 		Cluster:   "cluster2",
-		Namespace: kubecost.UnmountedSuffix,
+		Namespace: opencost.UnmountedSuffix,
 	},
-	Pod: kubecost.UnmountedSuffix,
+	Pod: opencost.UnmountedSuffix,
 }
 
-var kcPVKey1 = kubecost.PVKey{
+var kcPVKey1 = opencost.PVKey{
 	Cluster: "cluster1",
 	Name:    "pv1",
 }
 
-var kcPVKey2 = kubecost.PVKey{
+var kcPVKey2 = opencost.PVKey{
 	Cluster: "cluster1",
 	Name:    "pv2",
 }
 
-var kcPVKey3 = kubecost.PVKey{
+var kcPVKey3 = opencost.PVKey{
 	Cluster: "cluster2",
 	Name:    "pv3",
 }
 
-var kcPVKey4 = kubecost.PVKey{
+var kcPVKey4 = opencost.PVKey{
 	Cluster: "cluster2",
 	Name:    "pv4",
 }
@@ -114,13 +115,13 @@ var podMap1 = map[podKey]*pod{
 		Start:  *window.Start(),
 		End:    *window.End(),
 		Key:    podKeyUnmounted,
-		Allocations: map[string]*kubecost.Allocation{
-			kubecost.UnmountedSuffix: {
-				Name: fmt.Sprintf("%s/%s/%s/%s", podKeyUnmounted.Cluster, podKeyUnmounted.Namespace, podKeyUnmounted.Pod, kubecost.UnmountedSuffix),
-				Properties: &kubecost.AllocationProperties{
+		Allocations: map[string]*opencost.Allocation{
+			opencost.UnmountedSuffix: {
+				Name: fmt.Sprintf("%s/%s/%s/%s", podKeyUnmounted.Cluster, podKeyUnmounted.Namespace, podKeyUnmounted.Pod, opencost.UnmountedSuffix),
+				Properties: &opencost.AllocationProperties{
 					Cluster:   podKeyUnmounted.Cluster,
 					Node:      "",
-					Container: kubecost.UnmountedSuffix,
+					Container: opencost.UnmountedSuffix,
 					Namespace: podKeyUnmounted.Namespace,
 					Pod:       podKeyUnmounted.Pod,
 					Services:  []string{"LB1"},
@@ -130,8 +131,8 @@ var podMap1 = map[podKey]*pod{
 				End:                        *window.End(),
 				LoadBalancerCost:           0.60,
 				LoadBalancerCostAdjustment: 0,
-				PVs: kubecost.PVAllocations{
-					kcPVKey2: &kubecost.PVAllocation{
+				PVs: opencost.PVAllocations{
+					kcPVKey2: &opencost.PVAllocation{
 						ByteHours: 24 * Gi,
 						Cost:      2.25,
 					},
@@ -272,6 +273,9 @@ func TestBuildPVMap(t *testing.T) {
 					},
 					Values: []*util.Vector{
 						{
+							Timestamp: startFloat,
+						},
+						{
 							Timestamp: startFloat + (hour * 6),
 						},
 						{
@@ -288,6 +292,9 @@ func TestBuildPVMap(t *testing.T) {
 						"persistentvolume": "pv2",
 					},
 					Values: []*util.Vector{
+						{
+							Timestamp: startFloat,
+						},
 						{
 							Timestamp: startFloat + (hour * 6),
 						},
@@ -309,6 +316,9 @@ func TestBuildPVMap(t *testing.T) {
 					},
 					Values: []*util.Vector{
 						{
+							Timestamp: startFloat + (hour * 6),
+						},
+						{
 							Timestamp: startFloat + (hour * 12),
 						},
 						{
@@ -322,6 +332,9 @@ func TestBuildPVMap(t *testing.T) {
 						"persistentvolume": "pv4",
 					},
 					Values: []*util.Vector{
+						{
+							Timestamp: startFloat,
+						},
 						{
 							Timestamp: startFloat + (hour * 6),
 						},
@@ -341,7 +354,7 @@ func TestBuildPVMap(t *testing.T) {
 	for name, testCase := range testCases {
 		t.Run(name, func(t *testing.T) {
 			pvMap := make(map[pvKey]*pv)
-			buildPVMap(testCase.resolution, pvMap, testCase.resultsPVCostPerGiBHour, testCase.resultsActiveMinutes)
+			buildPVMap(testCase.resolution, pvMap, testCase.resultsPVCostPerGiBHour, testCase.resultsActiveMinutes, []*prom.QueryResult{}, window)
 			if len(pvMap) != len(testCase.expected) {
 				t.Errorf("pv map does not have the expected length %d : %d", len(pvMap), len(testCase.expected))
 			}
@@ -352,7 +365,7 @@ func TestBuildPVMap(t *testing.T) {
 					t.Errorf("pv map is missing key %s", thisPVKey)
 				}
 				if !actualPV.equal(expectedPV) {
-					t.Errorf("pv does not match with key %s", thisPVKey)
+					t.Errorf("pv does not match with key %s: %s != %s", thisPVKey, opencost.NewClosedWindow(actualPV.Start, actualPV.End), opencost.NewClosedWindow(expectedPV.Start, expectedPV.End))
 				}
 			}
 		})
@@ -363,7 +376,7 @@ func TestBuildPVMap(t *testing.T) {
 
 func TestGetUnmountedPodForCluster(t *testing.T) {
 	testCases := map[string]struct {
-		window   kubecost.Window
+		window   opencost.Window
 		podMap   map[podKey]*pod
 		cluster  string
 		expected *pod
@@ -377,15 +390,15 @@ func TestGetUnmountedPodForCluster(t *testing.T) {
 				Start:  *window.Start(),
 				End:    *window.End(),
 				Key:    getUnmountedPodKey("cluster1"),
-				Allocations: map[string]*kubecost.Allocation{
-					kubecost.UnmountedSuffix: {
-						Name: fmt.Sprintf("%s/%s/%s/%s", "cluster1", kubecost.UnmountedSuffix, kubecost.UnmountedSuffix, kubecost.UnmountedSuffix),
-						Properties: &kubecost.AllocationProperties{
+				Allocations: map[string]*opencost.Allocation{
+					opencost.UnmountedSuffix: {
+						Name: fmt.Sprintf("%s/%s/%s/%s", "cluster1", opencost.UnmountedSuffix, opencost.UnmountedSuffix, opencost.UnmountedSuffix),
+						Properties: &opencost.AllocationProperties{
 							Cluster:   "cluster1",
 							Node:      "",
-							Container: kubecost.UnmountedSuffix,
-							Namespace: kubecost.UnmountedSuffix,
-							Pod:       kubecost.UnmountedSuffix,
+							Container: opencost.UnmountedSuffix,
+							Namespace: opencost.UnmountedSuffix,
+							Pod:       opencost.UnmountedSuffix,
 						},
 						Window: window,
 						Start:  *window.Start(),
@@ -403,15 +416,15 @@ func TestGetUnmountedPodForCluster(t *testing.T) {
 				Start:  *window.Start(),
 				End:    *window.End(),
 				Key:    getUnmountedPodKey("cluster2"),
-				Allocations: map[string]*kubecost.Allocation{
-					kubecost.UnmountedSuffix: {
-						Name: fmt.Sprintf("%s/%s/%s/%s", "cluster2", kubecost.UnmountedSuffix, kubecost.UnmountedSuffix, kubecost.UnmountedSuffix),
-						Properties: &kubecost.AllocationProperties{
+				Allocations: map[string]*opencost.Allocation{
+					opencost.UnmountedSuffix: {
+						Name: fmt.Sprintf("%s/%s/%s/%s", "cluster2", opencost.UnmountedSuffix, opencost.UnmountedSuffix, opencost.UnmountedSuffix),
+						Properties: &opencost.AllocationProperties{
 							Cluster:   "cluster2",
 							Node:      "",
-							Container: kubecost.UnmountedSuffix,
-							Namespace: kubecost.UnmountedSuffix,
-							Pod:       kubecost.UnmountedSuffix,
+							Container: opencost.UnmountedSuffix,
+							Namespace: opencost.UnmountedSuffix,
+							Pod:       opencost.UnmountedSuffix,
 							Services:  []string{"LB1"},
 						},
 						Window:                     window,
@@ -419,8 +432,8 @@ func TestGetUnmountedPodForCluster(t *testing.T) {
 						End:                        *window.End(),
 						LoadBalancerCost:           .60,
 						LoadBalancerCostAdjustment: 0,
-						PVs: kubecost.PVAllocations{
-							kcPVKey2: &kubecost.PVAllocation{
+						PVs: opencost.PVAllocations{
+							kcPVKey2: &opencost.PVAllocation{
 								ByteHours: 24 * Gi,
 								Cost:      2.25,
 							},
@@ -456,6 +469,9 @@ func TestCalculateStartAndEnd(t *testing.T) {
 			result: &prom.QueryResult{
 				Values: []*util.Vector{
 					{
+						Timestamp: startFloat,
+					},
+					{
 						Timestamp: startFloat + (minute * 60),
 					},
 				},
@@ -468,6 +484,9 @@ func TestCalculateStartAndEnd(t *testing.T) {
 			result: &prom.QueryResult{
 				Values: []*util.Vector{
 					{
+						Timestamp: startFloat,
+					},
+					{
 						Timestamp: startFloat + (minute * 30),
 					},
 					{
@@ -478,8 +497,8 @@ func TestCalculateStartAndEnd(t *testing.T) {
 		},
 		"15 minute resolution, 45 minute window": {
 			resolution:    time.Minute * 15,
-			expectedStart: windowStart.Add(time.Minute * -15),
-			expectedEnd:   windowStart.Add(time.Minute * 30),
+			expectedStart: windowStart,
+			expectedEnd:   windowStart.Add(time.Minute * 45),
 			result: &prom.QueryResult{
 				Values: []*util.Vector{
 					{
@@ -491,6 +510,60 @@ func TestCalculateStartAndEnd(t *testing.T) {
 					{
 						Timestamp: startFloat + (minute * 30),
 					},
+					{
+						Timestamp: startFloat + (minute * 45),
+					},
+				},
+			},
+		},
+		"1 minute resolution, 5 minute window": {
+			resolution:    time.Minute,
+			expectedStart: windowStart.Add(time.Minute * 15),
+			expectedEnd:   windowStart.Add(time.Minute * 20),
+			result: &prom.QueryResult{
+				Values: []*util.Vector{
+					{
+						Timestamp: startFloat + (minute * 15),
+					},
+					{
+						Timestamp: startFloat + (minute * 16),
+					},
+					{
+						Timestamp: startFloat + (minute * 17),
+					},
+					{
+						Timestamp: startFloat + (minute * 18),
+					},
+					{
+						Timestamp: startFloat + (minute * 19),
+					},
+					{
+						Timestamp: startFloat + (minute * 20),
+					},
+				},
+			},
+		},
+		"1 minute resolution, 1 minute window": {
+			resolution:    time.Minute,
+			expectedStart: windowStart.Add(time.Minute * 14).Add(time.Second * 30),
+			expectedEnd:   windowStart.Add(time.Minute * 15).Add(time.Second * 30),
+			result: &prom.QueryResult{
+				Values: []*util.Vector{
+					{
+						Timestamp: startFloat + (minute * 15),
+					},
+				},
+			},
+		},
+		"1 minute resolution, 1 minute window, at window start": {
+			resolution:    time.Minute,
+			expectedStart: windowStart,
+			expectedEnd:   windowStart.Add(time.Second * 30),
+			result: &prom.QueryResult{
+				Values: []*util.Vector{
+					{
+						Timestamp: startFloat,
+					},
 				},
 			},
 		},
@@ -498,12 +571,12 @@ func TestCalculateStartAndEnd(t *testing.T) {
 
 	for name, testCase := range testCases {
 		t.Run(name, func(t *testing.T) {
-			start, end := calculateStartAndEnd(testCase.result, testCase.resolution)
+			start, end := calculateStartAndEnd(testCase.result, testCase.resolution, window)
 			if !start.Equal(testCase.expectedStart) {
-				t.Errorf("start to not match expected %v : %v", start, testCase.expectedStart)
+				t.Errorf("start does not match: expected %v; got %v", testCase.expectedStart, start)
 			}
 			if !end.Equal(testCase.expectedEnd) {
-				t.Errorf("end to not match expected %v : %v", end, testCase.expectedEnd)
+				t.Errorf("end does not match: expected %v; got %v", testCase.expectedEnd, end)
 			}
 		})
 	}

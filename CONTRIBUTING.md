@@ -3,7 +3,7 @@
 Thanks for your help improving the OpenCost project! There are many ways to contribute to the project, including the following:
 
 * contributing or providing feedback on the [OpenCost Spec](https://github.com/opencost/opencost/tree/develop/spec)
-* contributing documentation here or to the [OpenCost website](https://github.com/kubecost/opencost-website)
+* contributing documentation here or to the [OpenCost website](https://github.com/opencost/opencost-website)
 * joining the discussion in the [CNCF Slack](https://slack.cncf.io/) in the [#opencost](https://cloud-native.slack.com/archives/C03D56FPD4G) channel
 * keep up with community events using our [Calendar](https://bit.ly/opencost-calendar)
 * participating in the fortnightly [OpenCost Working Group](https://bit.ly/opencost-calendar) meetings ([notes here](https://bit.ly/opencost-meeting))
@@ -12,7 +12,7 @@ Thanks for your help improving the OpenCost project! There are many ways to cont
 ## Getting Help
 
 If you have a question about OpenCost or have encountered problems using it,
-you can start by asking a question on [CNCF Slack](https://slack.cncf.io/) in the [#opencost](https://cloud-native.slack.com/archives/C03D56FPD4G) channel or via email at [opencost@kubecost.com](opencost@kubecost.com)
+you can start by asking a question on [CNCF Slack](https://slack.cncf.io/) in the [#opencost](https://cloud-native.slack.com/archives/C03D56FPD4G) channel or attend the biweekly [OpenCost Working Group community meeting](https://bit.ly/opencost-meeting) from the [Community Calendar](https://bit.ly/opencost-calendar) to discuss OpenCost development.
 
 ## Workflow
 
@@ -24,18 +24,32 @@ This repository's contribution workflow follows a typical open-source model:
 
 ## Building OpenCost
 
-Follow these steps to build the OpenCost cost-model and UI from source and deploy:
+Follow these steps to build the OpenCost cost-model and UI from source and
+deploy. The provided build tooling is natively multi-architecture (built images
+will run on both AMD64 and ARM64 clusters).
 
-1. `docker build --rm -f "Dockerfile" -t <repo>/opencost:<tag> .`
+Dependencies:
+1. Docker (with `buildx`)
+2. [just](https://github.com/casey/just) (if you don't want to install it , Just read the `justfile` and run the commands manually)
+3. Multi-arch `buildx` builders set up via https://github.com/tonistiigi/binfmt
+4. `manifest-tool` via https://github.com/estesp/manifest-tool
+4. `npm` (if you want to build the UI)
+
+### Build the backend
+
+1. `just build "<repo>/opencost:<tag>"`
 2. Edit the [pulled image](https://github.com/opencost/opencost/blob/develop/kubernetes/opencost.yaml#L145) in the `kubernetes/opencost.yaml` to `<repo>/opencost:<tag>`
 3. Set [this environment variable](https://github.com/opencost/opencost/blob/develop/kubernetes/opencost.yaml#L155) to the address of your Prometheus server
-4. `cd ui`
-5. `docker build --rm -f "Dockerfile" -t <repo>/opencost-ui:<tag> .`
-6. `cd ..`
-7. Edit the [pulled image](https://github.com/opencost/opencost/blob/develop/kubernetes/opencost.yaml#L162) in the `kubernetes/opencost.yaml` to `<repo>/opencost-ui:<tag>`
-8. `kubectl create namespace opencost`
-9. `kubectl apply -f kubernetes/opencost --namespace opencost`
-10. `kubectl -n opencost port-forward service/opencost 9090 9003`
+
+### Build the frontend
+1. `cd ui && just build "<repo>/opencost-ui:<tag>"`
+2. Edit the [pulled image](https://github.com/opencost/opencost/blob/develop/kubernetes/opencost.yaml#L162) in the `kubernetes/opencost.yaml` to `<repo>/opencost-ui:<tag>`
+
+### Deploy to a cluster
+
+1. `kubectl create namespace opencost`
+2. `kubectl apply -f kubernetes/opencost --namespace opencost`
+3. `kubectl -n opencost port-forward service/opencost 9090 9003`
 
 To test, build the OpenCost containers and then push them to a Kubernetes cluster with a running Prometheus.
 
@@ -72,8 +86,14 @@ export KUBECONFIG=~/.kube/config
 An example of the full command:
 
 ```bash
-ETL_PATH_PREFIX="/my/cool/path/kubecost/var/config" CONFIG_PATH="/my/cool/path/kubecost/var/config" PROMETHEUS_SERVER_ENDPOINT="http://127.0.0.1:9090" go run main.go
+PROMETHEUS_SERVER_ENDPOINT="http://127.0.0.1:9090" go run main.go
 ```
+
+## Testing code
+
+Testing is provided by the `just test` command which runs
+- [go test](https://go.dev/doc/tutorial/add-a-test) unit tests
+- [go vet](https://pkg.go.dev/cmd/vet) code quality checks
 
 ## Running the integration tests
 
@@ -96,4 +116,35 @@ Please write a commit message with Fixes Issue # if there is an outstanding issu
 
 Please run `go fmt` on the project directory. Lint can be okay (for example, comments on exported functions are nice but not required on the server).
 
-Please email us [opencost@kubecost.com](opencost@kubecost.com) or reach out to us on [CNCF Slack](https://slack.cncf.io/) in the [#opencost](https://cloud-native.slack.com/archives/C03D56FPD4G) channel if you need help or have any questions!
+Please reach us on [CNCF Slack](https://slack.cncf.io/) in the [#opencost](https://cloud-native.slack.com/archives/C03D56FPD4G) channel or attend the biweekly [OpenCost Working Group community meeting](https://bit.ly/opencost-meeting) from the [Community Calendar](https://bit.ly/opencost-calendar) to discuss OpenCost development.
+
+## Third Party Attributions
+
+The THIRD_PARTY_LICENSES.txt file should contain the up-to-date license, copyright, and notice information for dependencies used by Opencost.
+When adding, updating, or removing dependencies, please update the associate section(s) of the [THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt) file. 
+
+For example, the `github.com/opencost/opencost/core` dependency contains the following third party attributions.
+The license associated with the SPDX identifier should also be included in the attributions file, if it is not already present.
+
+```
+== Dependency
+github.com/opencost/opencost/core
+
+== License Type
+SPDX:Apache-2.0
+
+== Copyright
+Copyright 2019 - 2022 Stackwatch Incorporated. All Rights Reserved.
+Copyright 2022 - 2024 Cloud Native Computing Foundation
+
+== Notices
+OpenCost
+Copyright 2022 - 2024 Cloud Native Computing Foundation
+
+This product includes software developed at
+The Cloud Native Computing Foundation (http://www.cncf.io).
+
+The Initial Developer of some parts of the specification and project is
+Kubecost (http://www.kubecost.com).
+Copyright 2019 - 2022 Stackwatch Incorporated. All Rights Reserved.
+```

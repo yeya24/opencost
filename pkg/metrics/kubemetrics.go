@@ -5,8 +5,8 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/opencost/opencost/core/pkg/util/promutil"
 	"github.com/opencost/opencost/pkg/clustercache"
-	"github.com/opencost/opencost/pkg/prom"
 
 	"github.com/prometheus/client_golang/prometheus"
 	batchv1 "k8s.io/api/batch/v1"
@@ -29,6 +29,7 @@ type KubeMetricsOpts struct {
 	EmitPodAnnotations            bool
 	EmitKubeStateMetrics          bool
 	EmitKubeStateMetricsV1Only    bool
+	EmitDeprecatedMetrics         bool
 }
 
 // DefaultKubeMetricsOpts returns KubeMetricsOpts with default values set
@@ -39,6 +40,7 @@ func DefaultKubeMetricsOpts() *KubeMetricsOpts {
 		EmitPodAnnotations:            false,
 		EmitKubeStateMetrics:          true,
 		EmitKubeStateMetricsV1Only:    false,
+		EmitDeprecatedMetrics:         false,
 	}
 }
 
@@ -49,6 +51,20 @@ func InitKubeMetrics(clusterCache clustercache.ClusterCache, metricsConfig *Metr
 	}
 
 	kubeMetricInit.Do(func() {
+		if !opts.EmitDeprecatedMetrics {
+			metricsConfig.DisabledMetrics = append(metricsConfig.DisabledMetrics,
+				"kube_pod_container_resource_limits",
+				"kube_pod_container_resource_limits_memory_bytes",
+				"kube_pod_container_resource_limits_cpu_cores",
+				"kube_pod_container_status_restarts_total",
+				"kube_node_status_condition",
+				"kube_deployment_status_replicas_available",
+				"kube_deployment_spec_replicas",
+				"kube_persistentvolume_status_phase",
+				"kube_pod_status_phase",
+			)
+		}
+
 		if opts.EmitKubecostControllerMetrics {
 			prometheus.MustRegister(KubecostServiceCollector{
 				KubeClusterCache: clusterCache,
@@ -108,6 +124,9 @@ func InitKubeMetrics(clusterCache clustercache.ClusterCache, metricsConfig *Metr
 				metricsConfig:    *metricsConfig,
 			})
 		} else if opts.EmitKubeStateMetricsV1Only {
+			// We still need the kubecost_pv_info metric to look up storageclass on legacy clusters.
+			forceDisabled := []string{"kube_persistentvolume_capacity_bytes", "kube_persistentvolume_status_phase"}
+			metricsConfig.DisabledMetrics = append(metricsConfig.DisabledMetrics, forceDisabled...)
 			prometheus.MustRegister(KubeNodeCollector{
 				KubeClusterCache: clusterCache,
 				metricsConfig:    *metricsConfig,
@@ -117,6 +136,18 @@ func InitKubeMetrics(clusterCache clustercache.ClusterCache, metricsConfig *Metr
 				metricsConfig:    *metricsConfig,
 			})
 			prometheus.MustRegister(KubePodLabelsCollector{
+				KubeClusterCache: clusterCache,
+				metricsConfig:    *metricsConfig,
+			})
+			prometheus.MustRegister(KubePVCollector{
+				KubeClusterCache: clusterCache,
+				metricsConfig:    *metricsConfig,
+			})
+		} else {
+			// We still need the kubecost_pv_info metric to look up storageclass on legacy clusters.
+			forceDisabled := []string{"kube_persistentvolume_capacity_bytes", "kube_persistentvolume_status_phase"}
+			metricsConfig.DisabledMetrics = append(metricsConfig.DisabledMetrics, forceDisabled...)
+			prometheus.MustRegister(KubePVCollector{
 				KubeClusterCache: clusterCache,
 				metricsConfig:    *metricsConfig,
 			})
@@ -130,7 +161,7 @@ func InitKubeMetrics(clusterCache clustercache.ClusterCache, metricsConfig *Metr
 
 // getPersistentVolumeClaimClass returns StorageClassName. If no storage class was
 // requested, it returns "".
-func getPersistentVolumeClaimClass(claim *v1.PersistentVolumeClaim) string {
+func getPersistentVolumeClaimClass(claim *clustercache.PersistentVolumeClaim) string {
 	// Use beta annotation first
 	if class, found := claim.Annotations[v1.BetaStorageClassAnnotation]; found {
 		return class
@@ -141,13 +172,13 @@ func getPersistentVolumeClaimClass(claim *v1.PersistentVolumeClaim) string {
 	}
 
 	// Special non-empty string to indicate absence of storage class.
-	return "<none>"
+	return ""
 }
 
 // toResourceUnitValue accepts a resource name and quantity and returns the sanitized resource, the unit, and the value in the units.
 // Returns an empty string for resource and unit if there was a failure.
 func toResourceUnitValue(resourceName v1.ResourceName, quantity resource.Quantity) (resource string, unit string, value float64) {
-	resource = prom.SanitizeLabelName(string(resourceName))
+	resource = promutil.SanitizeLabelName(string(resourceName))
 
 	switch resourceName {
 	case v1.ResourceCPU:
